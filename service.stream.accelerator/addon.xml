@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="service.stream.accelerator" name="Multi-Threaded Stream Accelerator" version="1.0.0" provider-name="Custom">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+        <import addon="script.module.requests" version="2.25.1"/>
+    </requires>
+
+    <!-- Background Proxy Daemon -->
+    <extension point="xbmc.service" library="service.py" start="login"/>
+
+    <!-- Script entry point for RunScript() hotkey actions -->
+    <extension point="xbmc.python.script" library="script.py"/>
+
+    <!-- Importable Helper Module for other Add-ons -->
+    <extension point="xbmc.python.module" library="resources/lib"/>
+
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">Local multi-threaded HTTP byte-range streaming proxy</summary>
+        <description lang="en_GB">Accelerates single-stream HTTP sources (Easynews, Debrid, WebDAV) using parallel chunked byte-range requests in RAM. Press Ctrl+D during playback to show the stats overlay, Ctrl+Shift+D to toggle the proxy on/off.</description>
+        <platform>all</platform>
+    </extension>
+</addon>
+

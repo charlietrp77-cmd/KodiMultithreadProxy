@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+    <category label="Proxy Engine">
+        <setting id="port" type="number" label="Local Proxy Port" default="48990"/>
+        <setting id="threads" type="slider" label="Worker Threads per Stream" default="6" range="1,1,16" option="int"/>
+        <setting id="chunk_size_kb" type="slider" label="Chunk Size (KB)" default="1024" range="256,256,8192" option="int"/>
+        <setting id="read_ahead" type="slider" label="Max Read-Ahead Chunks in RAM" default="12" range="2,1,32" option="int"/>
+        <setting id="retries" type="slider" label="Chunk Retry Attempts" default="3" range="1,1,10" option="int"/>
+        <setting id="small_read_threshold_mb" type="slider" label="Small Read Bypass Threshold (MB)" default="2" range="1,1,8" option="int"/>
+    </category>
+    <category label="Overlay">
+        <setting id="overlay_enabled" type="bool" label="Enable Stats Overlay Hotkey (Ctrl+D)" default="true"/>
+    </category>
+</settings>
+
