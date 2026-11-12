@@ -100,7 +100,7 @@ class ParallelRangeStream:
                     self.clean_url,
                     headers=req_headers,
                     stream=True,
-                    timeout=(5, 30)
+                    timeout=(4, 8)
                 )
 
                 if resp.status_code == 206:
@@ -250,7 +250,6 @@ class ParallelRangeStream:
 
                     chunk_data = self.buffer.pop(self.next_chunk_to_yield)
                     self.next_chunk_to_yield += 1
-                    self._chunks_yielded += 1
                     self._schedule_window()
                     self.stats.update_buffer(
                         len(self.buffer), self._active_worker_count
@@ -258,6 +257,7 @@ class ParallelRangeStream:
 
                 self.stats.record_chunk_delivered(len(chunk_data))
                 yield chunk_data
+                self._chunks_yielded += 1
 
         finally:
             self.close()

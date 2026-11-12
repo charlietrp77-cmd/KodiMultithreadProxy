@@ -31,6 +31,7 @@ MARGIN = 30
 
 # Kodi action IDs
 ACTION_PREVIOUS_MENU = 10
+ACTION_STOP = 13
 ACTION_NAV_BACK = 92
 ACTION_BACKSPACE = 110
 
@@ -81,21 +82,25 @@ class StatsOverlay(xbmcgui.WindowDialog):
         self.stats = StreamStats.instance()
         self._running = False
         self._update_thread = None
+        self._modal_thread = None
         self._labels = {}
         self._bg_path = _ensure_bg_texture()
         self._build_ui()
 
-    def onAction(self, action):
-        """Handle keyboard/remote actions without stealing focus from player.
+    def onInit(self):
+        try:
+            self._refresh()
+        except Exception:
+            pass
 
-        Only Back/Escape closes the overlay. All other actions (pause, stop,
-        seek, OSD toggle, volume) are ignored here so they fall through to
-        the underlying Kodi player window.
+    def onAction(self, action):
+        """Close the overlay on Back/Escape/Stop.
+
+        Runs inside the doModal() loop so Kodi dispatches key/remote actions here.
         """
         action_id = action.getId()
-        if action_id in (ACTION_PREVIOUS_MENU, ACTION_NAV_BACK, ACTION_BACKSPACE):
+        if action_id in (ACTION_PREVIOUS_MENU, ACTION_NAV_BACK, ACTION_BACKSPACE, ACTION_STOP):
             self.hide_overlay()
-        # All other actions: do nothing, let Kodi handle them
 
     def _build_ui(self):
         screen_w = self.getWidth() or 1920
@@ -230,15 +235,27 @@ class StatsOverlay(xbmcgui.WindowDialog):
                 lbl.setLabel("")
             self._labels["speed"].setLabel("Start playing a proxied URL to see stats")
 
+    def _run_modal(self):
+        try:
+            self.doModal()
+        except Exception:
+            pass
+        finally:
+            self._running = False
+
     def show_overlay(self):
-        self.show()
         self._running = True
+        self._modal_thread = threading.Thread(target=self._run_modal, daemon=True)
+        self._modal_thread.start()
         self._update_thread = threading.Thread(target=self._update_loop, daemon=True)
         self._update_thread.start()
 
     def hide_overlay(self):
         self._running = False
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # ─── Global overlay instance (lives in service interpreter) ───────────────

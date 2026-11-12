@@ -306,7 +306,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         chunk_kb = int(params.get("chunk_kb", [_get_addon_setting("chunk_size_kb", 1024)])[0])
         read_ahead = int(params.get("read_ahead", [_get_addon_setting("read_ahead", 12)])[0])
         retries = int(_get_addon_setting("retries", 3))
-        small_threshold = int(_get_addon_setting("small_read_threshold_mb", 2)) * 1024 * 1024
+        small_threshold = int(_get_addon_setting("small_read_threshold_mb", 4)) * 1024 * 1024
         chunk_size = chunk_kb * 1024
 
         try:
@@ -375,13 +375,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._direct_passthrough(final_url, upstream_headers, start_byte, end_byte, sid)
             return
 
-        # Small read bypass
+        # Small read bypass — do not overwrite stats if a main stream is active
         if content_length <= small_threshold:
             log_verbose(
                 TAG,
                 f"Mode=BYPASS_SMALL ({content_length:,} B <= threshold {small_threshold:,} B)"
             )
-            sid = stats.reset(total_size, content_type, clean_url, 1, chunk_size, 1, mode="bypass_small")
+            sid = stats.reset_if_idle(total_size, content_type, clean_url, 1, chunk_size, 1, mode="bypass_small")
             self._single_range_fetch(final_url, upstream_headers, start_byte, end_byte, sid)
             return
 
@@ -427,45 +427,50 @@ class ProxyHandler(BaseHTTPRequestHandler):
         t0 = time.monotonic()
         sent = 0
         max_attempts = 3
+        label = f"#{stream_id}" if stream_id is not None else "(concurrent)"
         try:
             for attempt in range(max_attempts):
                 resp = None
                 try:
-                    resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(4, 8))
+                    # Short (3, 5) timeout ensures all 3 retries fit inside Kodi's 20s CCurlFile timeout
+                    resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(3, 5))
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             try:
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
                             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                                log_verbose(TAG, f"Small read #{stream_id} client disconnected after {sent:,} B")
-                                stats.record_seek()
+                                log_verbose(TAG, f"Small read {label} client disconnected after {sent:,} B")
+                                if stream_id is not None:
+                                    stats.record_seek()
                                 return
                             sent += len(chunk)
-                            stats.record_bytes_delivered(len(chunk))
+                            if stream_id is not None:
+                                stats.record_bytes_delivered(len(chunk))
                     log_verbose(
                         TAG,
-                        f"Small read #{stream_id} complete: {sent:,} B in {(time.monotonic()-t0)*1000:.0f}ms"
+                        f"Small read {label} complete: {sent:,} B in {(time.monotonic()-t0)*1000:.0f}ms"
                     )
                     return
                 except requests.exceptions.RequestException as e:
                     if sent == 0 and attempt < max_attempts - 1:
                         log_warning(
                             TAG,
-                            f"Small read #{stream_id} attempt {attempt+1}/{max_attempts} stalled/failed ({e}), retrying..."
+                            f"Small read {label} attempt {attempt+1}/{max_attempts} stalled/failed ({e}), retrying..."
                         )
                         time.sleep(0.2)
                         continue
-                    log_warning(TAG, f"Small read #{stream_id} upstream error after {sent:,} B: {e}")
+                    log_warning(TAG, f"Small read {label} upstream error after {sent:,} B: {e}")
                     return
                 except Exception as e:
-                    log_warning(TAG, f"Small read #{stream_id} error: {e}")
+                    log_warning(TAG, f"Small read {label} error: {e}")
                     return
                 finally:
                     if resp is not None:
                         resp.close()
         finally:
-            stats.stop(stream_id=stream_id)
+            if stream_id is not None:
+                stats.stop(stream_id=stream_id)
 
     def _direct_passthrough(self, final_url, headers, start_byte, end_byte, stream_id):
         stats = StreamStats.instance()

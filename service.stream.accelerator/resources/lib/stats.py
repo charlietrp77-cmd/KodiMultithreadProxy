@@ -72,6 +72,13 @@ class StreamStats:
             self.start_time = time.monotonic()
             return sid
 
+    def reset_if_idle(self, file_size, content_type, url, threads, chunk_size, read_ahead, mode="bypass_small"):
+        """Reset stats only when no stream is active. Returns new stream_id or None."""
+        with self.lock:
+            if self.active:
+                return None
+            return self.reset(file_size, content_type, url, threads, chunk_size, read_ahead, mode=mode)
+
     def record_chunk_delivered(self, size_bytes):
         with self.lock:
             self.bytes_delivered += size_bytes
