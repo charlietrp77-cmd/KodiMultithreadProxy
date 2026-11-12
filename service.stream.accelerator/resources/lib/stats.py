@@ -23,7 +23,7 @@ class StreamStats:
 
     def __init__(self):
         self.active = False
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.stream_id = 0             # Monotonic counter, incremented on reset()
 
         # Per-stream metadata (reset on each new stream)

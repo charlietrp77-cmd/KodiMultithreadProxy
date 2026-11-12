@@ -11,5 +11,8 @@
     <category label="Overlay">
         <setting id="overlay_enabled" type="bool" label="Enable Stats Overlay Hotkey (Ctrl+D)" default="true"/>
     </category>
+    <category label="Debugging">
+        <setting id="verbose_logging" type="bool" label="Enable Verbose Logging (writes detailed diagnostics to kodi.log)" default="false"/>
+    </category>
 </settings>
 

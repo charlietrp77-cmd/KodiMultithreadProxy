@@ -14,6 +14,7 @@ import xbmcaddon
 import xbmcvfs
 from http.server import ThreadingHTTPServer
 from resources.lib.server import ProxyHandler
+from resources.lib.logutil import refresh_verbose
 
 # ── Keymap XML content ────────────────────────────────────────────────────────
 # Ctrl+D (key 0x10064 = 65636): Toggle stats overlay
@@ -65,6 +66,30 @@ def _uninstall_keymap():
         xbmc.log(f"[StreamAccelerator] Failed to remove keymap: {e}", xbmc.LOGWARNING)
 
 
+def _write_active_port(port):
+    """Persist the actual bound port so script.py and proxify() find fallback ports."""
+    try:
+        addon = xbmcaddon.Addon("service.stream.accelerator")
+        profile = xbmcvfs.translatePath(addon.getAddonInfo("profile"))
+        os.makedirs(profile, exist_ok=True)
+        with open(os.path.join(profile, "active_port"), "w", encoding="utf-8") as f:
+            f.write(str(port))
+    except Exception as e:
+        xbmc.log(f"[StreamAccelerator] Failed to write active_port: {e}", xbmc.LOGWARNING)
+
+
+def _remove_active_port():
+    """Clean up active_port marker on shutdown."""
+    try:
+        addon = xbmcaddon.Addon("service.stream.accelerator")
+        profile = xbmcvfs.translatePath(addon.getAddonInfo("profile"))
+        path = os.path.join(profile, "active_port")
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 class AcceleratorService(xbmc.Monitor):
     """Kodi service that runs the proxy server in a background thread."""
 
@@ -102,6 +127,7 @@ class AcceleratorService(xbmc.Monitor):
 
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+        _write_active_port(self.port)
         xbmc.log(
             f"[StreamAccelerator] Listening on 127.0.0.1:{self.port}",
             xbmc.LOGINFO
@@ -115,6 +141,7 @@ class AcceleratorService(xbmc.Monitor):
 
         # ── Cleanup ──────────────────────────────────────────────────────
         xbmc.log("[StreamAccelerator] Shutting down...", xbmc.LOGINFO)
+        _remove_active_port()
         _uninstall_keymap()
         if self.server:
             self.server.shutdown()
@@ -123,7 +150,11 @@ class AcceleratorService(xbmc.Monitor):
 
     def onSettingsChanged(self):
         """Called by Kodi when the user changes add-on settings."""
-        xbmc.log("[StreamAccelerator] Settings changed — will take effect on next stream", xbmc.LOGINFO)
+        verbose = refresh_verbose()
+        xbmc.log(
+            f"[StreamAccelerator] Settings changed (verbose_logging={verbose}) — will take effect on next stream",
+            xbmc.LOGINFO
+        )
 
 
 if __name__ == "__main__":

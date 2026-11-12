@@ -10,22 +10,32 @@ with the service process. Instead, we send HTTP requests to the proxy's
 /control endpoint which runs in the service interpreter.
 """
 import sys
+import os
 
 try:
     import xbmcaddon
+    import xbmcvfs
 except ImportError:
     xbmcaddon = None
+    xbmcvfs = None
 
 
 def _get_port():
-    port = "48990"
     if xbmcaddon:
         try:
             addon = xbmcaddon.Addon("service.stream.accelerator")
-            port = addon.getSetting("port") or "48990"
+            if xbmcvfs:
+                profile = xbmcvfs.translatePath(addon.getAddonInfo("profile"))
+                port_file = os.path.join(profile, "active_port")
+                if os.path.exists(port_file):
+                    with open(port_file, "r", encoding="utf-8") as f:
+                        val = f.read().strip()
+                        if val.isdigit():
+                            return val
+            return addon.getSetting("port") or "48990"
         except Exception:
             pass
-    return port
+    return "48990"
 
 
 def _send_control(action):

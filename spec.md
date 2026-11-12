@@ -99,16 +99,18 @@ The add-on is a **triple-extension** Kodi package:
 ```
 service.stream.accelerator/
 ├── addon.xml                   # Triple extension: service + module + script
-├── service.py                  # xbmc.service entry — daemon lifecycle, keymap install
-├── script.py                   # xbmc.python.script — RunScript() hotkey handler
+├── service.py                  # xbmc.service entry — daemon lifecycle, keymap install, active_port
+├── script.py                   # xbmc.python.script — RunScript() hotkey client via /control HTTP IPC
 └── resources/
     ├── settings.xml            # GUI settings (threads, chunk size, port, buffer, threshold)
     └── lib/
-        ├── __init__.py         # proxify() helper — importable by other add-ons
-        ├── stats.py            # Thread-safe StreamStats singleton (metrics collector)
-        ├── engine.py           # ParallelRangeStream — sliding-window chunk downloader
-        ├── server.py           # ProxyHandler — HTTP 206 range server + upstream probe
-        └── overlay.py          # StatsOverlay — OSD window + toggle functions
+        ├── __init__.py         # Package helper exposing proxify() + get_active_port()
+        ├── stream_accelerator.py # Top-level importable module (`import stream_accelerator`)
+        ├── logutil.py          # Optional verbose logging helper (LOGDEBUG -> LOGINFO)
+        ├── stats.py            # Thread-safe StreamStats singleton with stream_id race guard
+        ├── engine.py           # ParallelRangeStream — slow-start, streaming fetch, sliding window
+        ├── server.py           # ProxyHandler — HTTP 206 range server, probe cache, /control IPC
+        └── overlay.py          # StatsOverlay — non-focus-stealing OSD window
 ```
 
 ---
@@ -151,6 +153,8 @@ The proxy automatically selects the best strategy per-request:
 | `read_ahead` | Slider | 12 | 2–32 | Max chunks buffered ahead in RAM |
 | `retries` | Slider | 3 | 1–10 | Retry attempts per failed chunk |
 | `small_read_threshold_mb` | Slider | 2 | 1–8 | Below this size, skip threading |
+| `overlay_enabled` | Bool | `true` | — | Allow Ctrl+D stats overlay hotkey |
+| `verbose_logging` | Bool | `false` | — | Write detailed diagnostics (timings, chunks, stalls) to `kodi.log` at `LOGINFO` without enabling Kodi's debug overlay |
 
 **RAM footprint:** With defaults (1 MB chunks × 12 read-ahead), peak RAM is capped at **12 MB**. On Android TV with limited RAM, reduce `read_ahead` to 6–8.
 
@@ -194,7 +198,9 @@ Range: bytes=0-0
 
 If this returns `206`, we confirm range support and extract the total size from `Content-Range`. If it returns `200`, the server doesn't support ranges — we fall back to direct passthrough.
 
-**Critical: Redirect resolution** — The probe captures `resp.url` (the final URL after all 301/302 redirects) and passes this resolved URL to all worker threads. This prevents redirect amplification where N threads each independently follow redirects, which breaks providers with single-use redirect tokens (notably TorBox).
+**Critical: Redirect resolution & Probe Cache** — Two protections are built into `probe_upstream()`:
+1. **Phase 2 uses `final_url` from Phase 1:** If Phase 1 (`HEAD`) follows a redirect to `final_url` before falling back to Phase 2 (`GET bytes=0-0`), Phase 2 queries `final_url` directly instead of re-hitting `clean_url`.
+2. **15-Minute Probe Cache (`_PROBE_CACHE`):** `UpstreamProbeResult` is cached per `clean_url` for 900 seconds (`_PROBE_CACHE_TTL`). When Kodi/FFmpeg opens multiple startup connections (header → MKV Cues at EOF → video stream), subsequent requests reuse the cached `final_url` and metadata without re-probing. This guarantees single-use redirect tokens (TorBox) are consumed only once per stream.
 
 ### 5D. Streaming Engine
 
@@ -210,9 +216,10 @@ Kodi's VideoPlayer (ffmpeg) doesn't read linearly from byte 0. On MKV/MP4 startu
 
 If the proxy blindly spawned 6 threads from byte 0 on step 1, it would waste bandwidth and block step 2. The engine solves this with:
 
-#### Small-Read Bypass
+#### Small-Read Bypass & Chunk-0 Slow Start
 
-Requests where `content_length ≤ small_read_threshold` (default 2 MB) are served by a single direct HTTP request — no thread pool, no buffer overhead. This handles the header/cue reads in steps 1 and 2 with minimal latency.
+- **Small-Read Bypass:** Requests with a bounded `Content-Length ≤ small_read_threshold` (default 2 MB, such as MKV Cues at EOF) are served by a single direct HTTP request (`_single_range_fetch`) — no thread pool, no buffer overhead.
+- **Chunk-0 Slow Start:** FFmpeg's initial probe (`Range: bytes=0-`, open-ended) has `content_length == total_size`, so it cannot trigger small-read bypass. To avoid spinning up all 6 workers before FFmpeg aborts 40ms later to read EOF cues, `_schedule_window()` only dispatches Chunk 0 initially (`next_chunk_to_yield == 0`). Once Kodi actually reads Chunk 0 and requests Chunk 1, the full `read_ahead` window is dispatched across all workers.
 
 #### Sliding-Window Coordinator (for large reads)
 
@@ -238,9 +245,10 @@ Kodi Player (Consumer)
 **Instant Abort on Seek:**
 - When Kodi seeks (fast-forward, chapter skip), it closes the TCP socket → triggers `BrokenPipeError` / `ConnectionResetError`
 - The handler sets `abort_event` (a `threading.Event`), which:
-  - Causes all in-flight workers to exit early on their next check
-  - Cancels queued futures via `executor.shutdown(cancel_futures=True)`
+  - Causes workers streaming chunks via `resp.iter_content(chunk_size=65536)` (`stream=True`) to abort mid-download immediately rather than waiting for an entire 1 MB+ chunk
+  - Cancels queued futures via `executor.shutdown(wait=False, cancel_futures=True)`
   - Clears the RAM buffer immediately
+- Each stream receives a unique monotonic `stream_id` from `stats.reset()`. Calling `stats.stop(stream_id=...)` ignores stale threads so overlapping socket closes during fast seeks never mark a newly started stream as inactive.
 - Kodi then opens a new connection at the new byte offset and gets 100% of the threads
 
 #### Safety: Only HTTP 206 accepted
@@ -251,12 +259,12 @@ Workers **reject** `200` responses. If the upstream ignores the `Range` header a
 
 **File:** `resources/lib/stats.py` → `StreamStats`
 
-A thread-safe singleton that the engine writes to and the overlay reads from:
+A thread-safe singleton (living inside the `xbmc.service` interpreter) that the engine writes to and the overlay reads from:
 
 | Metric | Type | Updated By |
 |---|---|---|
-| `active` | bool | engine start/stop |
-| `enabled` | bool | user toggle (Ctrl+Shift+D) |
+| `active` | bool | engine start/stop (guarded by `stream_id`) |
+| `stream_id` | int | monotonic counter incremented on `reset()`, prevents stale thread clobber |
 | `mode` | str | server.py ("accelerated" / "direct" / "bypass_small") |
 | `file_size` | int | probe |
 | `content_type` | str | probe |
@@ -264,22 +272,25 @@ A thread-safe singleton that the engine writes to and the overlay reads from:
 | `chunks_completed` | int | each successful chunk |
 | `chunks_failed` | int | exhausted retries |
 | `chunks_retried` | int | each retry attempt |
-| `active_workers` | int | schedule_window / fetch completion |
+| `active_workers` | int | explicit worker counter in `_fetch_chunk` |
 | `buffer_fill` | int | schedule_window / chunk pop |
 | `buffer_max` | int | read_ahead setting |
 | `seeks` | int | each BrokenPipe/ConnectionReset |
 | `_speed_samples` | deque | rolling 5-second window of (timestamp, bytes) |
 
+*(Note: `_proxy_enabled` lives as a module-level flag in `server.py` inside the service interpreter, toggled via `/control?action=toggle`.)*
+
 **Derived metrics:**
 - `get_speed_mbps()` — live speed from rolling 5s window, in Mbit/s
 - `get_avg_speed_mbps()` — average speed since stream start
 - `get_elapsed()` — seconds since stream start
+- `to_dict()` — plain JSON-serializable snapshot served via `/control?action=stats`
 
 ### 5F. OSD Stats Overlay
 
 **File:** `resources/lib/overlay.py` → `StatsOverlay`
 
-A `xbmcgui.WindowDialog` rendered in the top-right corner of the screen (1080p). Updates every 500ms via a background thread.
+A non-focus-stealing `xbmcgui.WindowDialog` rendered in the top-right corner of the screen (1080p). Updates every 500ms via a background thread. Overriding `onAction()` closes the overlay on Back/Escape/Backspace while letting all other player controls (Pause, Seek, Stop, Volume, OSD) pass through to Kodi's player.
 
 ```
 ┌──────────────────────────────────────┐
@@ -316,13 +327,16 @@ A `xbmcgui.WindowDialog` rendered in the top-right corner of the screen (1080p).
 | **Ctrl+D** | 65636 | Toggle the OSD stats overlay on/off |
 | **Ctrl+Shift+D** | 196708 | Toggle proxy acceleration on/off (affects next stream) |
 
-**Implementation:** The service installs a keymap XML to `special://profile/keymaps/accelerator_keymap.xml` on startup and removes it on shutdown. The keymap triggers `RunScript(service.stream.accelerator, overlay)` or `RunScript(service.stream.accelerator, toggle)`, which are handled by `script.py` → dispatched to `overlay.py` functions.
+**Implementation (Sub-Interpreter IPC):** In Kodi's `XBPython`, `xbmc.service` (`service.py`) and `RunScript()` (`script.py`) run in separate Python sub-interpreters with isolated memory heaps. Therefore:
+1. The service installs a keymap XML to `special://profile/keymaps/accelerator_keymap.xml` on startup and removes it on shutdown.
+2. Pressing Ctrl+D or Ctrl+Shift+D launches `script.py`, which discovers the active port and sends an HTTP request to `http://127.0.0.1:<port>/control?action=overlay` or `?action=toggle`.
+3. `ProxyHandler._handle_control()` handles the request inside the `service.py` interpreter, where live `StreamStats`, `_proxy_enabled`, and `StatsOverlay` live.
 
 **Toggle behavior:**
-- Flips `StreamStats.instance().enabled`
+- Flips `server._proxy_enabled` in the service interpreter
 - Shows a Kodi notification: "Proxy ON — next stream will be accelerated" or "Proxy OFF — next stream goes direct"
 - Does **not** affect a currently-playing stream (the active `ParallelRangeStream` continues)
-- The next `/stream` request checks `stats.enabled` and routes to either the parallel engine or direct passthrough
+- The next `/stream` request checks `server._proxy_enabled` and routes to either the parallel engine or direct passthrough
 
 ### 5H. Service Lifecycle
 
@@ -332,6 +346,7 @@ A `xbmcgui.WindowDialog` rendered in the top-right corner of the screen (1080p).
    - Reads port from settings
    - Creates `ThreadingHTTPServer` on `127.0.0.1:<port>`
    - **Port-in-use handling:** If the port is taken (previous un-killed instance, conflict), catches `OSError` and tries `port + 1` as fallback. Logs a clear error if both fail.
+   - Writes the bound port to `special://profile/addon_data/service.stream.accelerator/active_port` so `script.py` and `proxify()` automatically discover fallback ports.
    - Starts server in a daemon thread
    - Installs hotkey keymap → triggers `Action(reloadkeymaps)`
 
@@ -339,32 +354,21 @@ A `xbmcgui.WindowDialog` rendered in the top-right corner of the screen (1080p).
    - `waitForAbort()` — blocks until Kodi exits
 
 3. **Shutdown:**
-   - Removes hotkey keymap
+   - Removes `active_port` file and hotkey keymap
    - `server.shutdown()` + `server.server_close()`
 
 ### 5I. Client Helper
 
-**File:** `resources/lib/__init__.py` → `proxify()`
+**Files:** `resources/lib/stream_accelerator.py` & `resources/lib/__init__.py` → `proxify()`
 
-One-line URL wrapper for other add-ons:
+One-line URL wrapper for other add-ons (supports `import stream_accelerator`):
 
 ```python
-from urllib.parse import quote
-import xbmcaddon
-
-def proxify(url, threads=None, chunk_kb=None, read_ahead=None):
-    """Wraps any Kodi stream URL into a local accelerated URL."""
-    addon = xbmcaddon.Addon("service.stream.accelerator")
-    port = addon.getSetting("port") or "48990"
-    proxy_url = f"http://127.0.0.1:{port}/stream?url={quote(url, safe='')}"
-    if threads is not None:
-        proxy_url += f"&threads={int(threads)}"
-    if chunk_kb is not None:
-        proxy_url += f"&chunk_kb={int(chunk_kb)}"
-    if read_ahead is not None:
-        proxy_url += f"&read_ahead={int(read_ahead)}"
-    return proxy_url
+import stream_accelerator
+proxy_url = stream_accelerator.proxify(raw_url, threads=8, chunk_kb=1024)
 ```
+
+Automatically reads `active_port` (or falls back to the `port` setting / `48990`).
 
 ---
 
@@ -435,6 +439,18 @@ During design review, 12 bugs/gaps were identified in the original spec. All hav
 |---|---|---|
 | 11 | `read_ahead` minimum was clamped to `threads`, silently inflating RAM. | Minimum is now `2`, independent of thread count. |
 | 12 | `parse_kodi_url()` called redundantly in both server and engine. | Parsed once in `_handle_request()`, clean URL + headers passed to engine. |
+
+### Kodi Sub-Interpreter & Real-World Edge-Case Fixes (`consider.txt`)
+
+| # | Issue | Fix Applied |
+|---|---|---|
+| 13 | **Sub-interpreter isolation.** `RunScript()` runs `script.py` in a separate Python interpreter from `service.py`, so toggling `StreamStats` or opening `StatsOverlay` failed across memory heaps. | Added HTTP IPC endpoint `/control?action=overlay\|toggle\|stats` in `server.py`; `script.py` queries `127.0.0.1:<port>/control`, and `_proxy_enabled` lives in `server.py`. |
+| 14 | **TorBox single-use token broken across FFmpeg startup requests.** Phase 2 GET re-hit `clean_url`, and uncached `probe_upstream()` re-hit `clean_url` on Request #2 (MKV Cues). | Cached `UpstreamProbeResult` in `_PROBE_CACHE` (15-min TTL) and made Phase 2 GET query `final_url` from Phase 1 HEAD. |
+| 15 | **`import stream_accelerator` threw `ModuleNotFoundError`.** `addon.xml` exports `resources/lib` directly on `sys.path`, so `__init__.py` wasn't importable as `stream_accelerator`. | Added `resources/lib/stream_accelerator.py` exposing `proxify()` and `get_active_port()`. |
+| 16 | **FFmpeg Step 1 (`bytes=0-`) bypassed small-read check & couldn't abort mid-chunk.** Open-ended range meant `content_length == total_size`, launching 6 blocking threads for a 32 KB probe. | Added Chunk-0 Slow Start (`next_chunk_to_yield == 0`) and streaming chunk fetch (`stream=True` + `iter_content(65536)` checking `abort_event`). |
+| 17 | **Modal overlay stole player focus.** `xbmcgui.WindowDialog` trapped Pause/Stop/Seek keys. | Overrode `onAction()` in `StatsOverlay` to close only on Back/Escape and pass playback keys through. |
+| 18 | **Seek race & inaccurate worker count.** Overlapping closes could clear new stream's `active` flag, and `len(in_flight)` counted queued tasks. | Added monotonic `stream_id` guard in `StreamStats.stop(stream_id=...)` and explicit `_active_worker_count` in `engine.py`. |
+| 19 | **Fallback port mismatch.** If `service.py` fell back to `port + 1`, `script.py` and `proxify()` still used the configured port. | `service.py` writes `active_port` in addon profile on bind (removed on shutdown); `script.py` and `proxify()` read it first. |
 
 ---
 

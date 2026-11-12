@@ -20,17 +20,14 @@ try:
     import xbmc
     import xbmcaddon
     _HAS_KODI = True
-    def _log(msg, level=None):
-        if level is None:
-            level = xbmc.LOGDEBUG
-        xbmc.log(f"[StreamAccelerator.Server] {msg}", level)
 except ImportError:
     _HAS_KODI = False
-    def _log(msg, level=None):
-        pass
 
 from .engine import ParallelRangeStream
 from .stats import StreamStats
+from .logutil import log_info, log_warning, log_error, log_verbose
+
+TAG = "StreamAccelerator.Server"
 
 RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
 
@@ -120,7 +117,11 @@ def probe_upstream(clean_url, headers):
     """
     cached = _get_cached_probe(clean_url)
     if cached is not None:
-        _log(f"Probe cache hit for {clean_url[:80]}")
+        log_verbose(
+            TAG,
+            f"Probe CACHE HIT: {urlparse(clean_url).netloc} -> "
+            f"size={cached.total_size}, ranges={cached.supports_ranges}"
+        )
         return cached
 
     total_size = 0
@@ -129,34 +130,43 @@ def probe_upstream(clean_url, headers):
     supports_ranges = False
 
     # Phase 1: HEAD
+    t0 = time.monotonic()
     try:
         resp = requests.head(clean_url, headers=headers.copy(), timeout=10,
                              allow_redirects=True)
+        head_ms = (time.monotonic() - t0) * 1000.0
         final_url = resp.url
         content_type = resp.headers.get("Content-Type", content_type)
         if "Content-Length" in resp.headers:
             total_size = int(resp.headers["Content-Length"])
         if resp.headers.get("Accept-Ranges", "").lower() == "bytes":
             supports_ranges = True
+        head_status = resp.status_code
         resp.close()
-        _log(f"HEAD probe: size={total_size}, type={content_type}, "
-             f"ranges={supports_ranges}, final_url={final_url[:100]}")
+        log_verbose(
+            TAG,
+            f"HEAD probe ({head_ms:.0f}ms): status={head_status}, size={total_size}, "
+            f"type={content_type}, ranges={supports_ranges}, "
+            f"final_host={urlparse(final_url).netloc}"
+        )
         if total_size > 0 and supports_ranges:
             result = UpstreamProbeResult(total_size, content_type, final_url, True)
             _set_cached_probe(clean_url, result)
             return result
     except Exception as e:
-        _log(f"HEAD probe failed: {e}, falling back to GET probe")
+        log_warning(TAG, f"HEAD probe failed ({(time.monotonic() - t0)*1000:.0f}ms): {e}, falling back to GET probe")
 
     # Phase 2: GET Range: bytes=0-0
     # CRITICAL: Use final_url (from HEAD redirect), NOT clean_url.
     # This prevents burning a second single-use redirect token on TorBox.
     probe_url = final_url if final_url != clean_url else clean_url
+    t1 = time.monotonic()
     try:
         get_headers = headers.copy()
         get_headers["Range"] = "bytes=0-0"
         resp = requests.get(probe_url, headers=get_headers, stream=True,
                             timeout=10, allow_redirects=True)
+        get_ms = (time.monotonic() - t1) * 1000.0
         final_url = resp.url
         content_type = resp.headers.get("Content-Type", content_type)
 
@@ -172,11 +182,16 @@ def probe_upstream(clean_url, headers):
             supports_ranges = False
             if "Content-Length" in resp.headers:
                 total_size = int(resp.headers["Content-Length"])
+        resp_status = resp.status_code
         resp.close()
-        _log(f"GET probe: size={total_size}, type={content_type}, "
-             f"ranges={supports_ranges}, status={resp.status_code}")
+        log_verbose(
+            TAG,
+            f"GET probe ({get_ms:.0f}ms): status={resp_status}, size={total_size}, "
+            f"type={content_type}, ranges={supports_ranges}, "
+            f"final_host={urlparse(final_url).netloc}"
+        )
     except Exception as e:
-        _log(f"GET probe also failed: {e}")
+        log_error(TAG, f"GET probe failed ({(time.monotonic() - t1)*1000:.0f}ms): {e}")
 
     if total_size <= 0:
         raise ValueError(
@@ -210,6 +225,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _send_json(self, payload_obj):
+        body = json.dumps(payload_obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     # ── /control endpoint (sub-interpreter IPC) ──────────────────────────
     def _handle_control(self):
         """Handle control commands from script.py via HTTP.
@@ -221,13 +245,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         global _proxy_enabled
         params = parse_qs(urlparse(self.path).query)
         action = params.get("action", [""])[0]
+        log_verbose(TAG, f"/control?action={action}")
 
         if action == "toggle":
             with _proxy_enabled_lock:
                 _proxy_enabled = not _proxy_enabled
                 state = _proxy_enabled
-            _log(f"Proxy toggled: {'enabled' if state else 'disabled'}",
-                 xbmc.LOGINFO if _HAS_KODI else None)
+            log_info(TAG, f"Proxy toggled: {'enabled' if state else 'disabled'}")
 
             # Show notification from within the service interpreter
             if _HAS_KODI:
@@ -238,21 +262,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     xbmcgui.NOTIFICATION_INFO, 3000
                 )
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"enabled": state}).encode())
+            self._send_json({"enabled": state})
 
         elif action == "overlay":
             # Toggle overlay from within the service interpreter
             if _HAS_KODI:
-                from .overlay import toggle_overlay
-                toggle_overlay()
+                try:
+                    addon = xbmcaddon.Addon("service.stream.accelerator")
+                    overlay_allowed = addon.getSettingBool("overlay_enabled")
+                except Exception:
+                    overlay_allowed = True
+                if overlay_allowed:
+                    from .overlay import toggle_overlay
+                    toggle_overlay()
+                else:
+                    log_verbose(TAG, "Overlay hotkey ignored (overlay_enabled=false in settings)")
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+            self._send_json({"ok": True})
 
         elif action == "stats":
             stats = StreamStats.instance()
@@ -260,10 +286,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             with _proxy_enabled_lock:
                 data["proxy_enabled"] = _proxy_enabled
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
+            self._send_json(data)
 
         else:
             self.send_error(400, f"Unknown control action: {action}")
@@ -289,7 +312,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             probe = probe_upstream(clean_url, upstream_headers)
         except Exception as e:
-            _log(f"Upstream probe failed: {e}")
+            log_error(TAG, f"Upstream probe failed: {e}")
             self.send_error(502, f"Upstream probe failed: {e}")
             return
 
@@ -310,6 +333,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     end_byte = min(int(match.group(2)), total_size - 1)
 
         content_length = (end_byte - start_byte) + 1
+        method = "GET" if send_body else "HEAD"
+        log_verbose(
+            TAG,
+            f"Incoming {method}: host={urlparse(clean_url).netloc}, "
+            f"Range={range_header or 'none'} -> bytes {start_byte}-{end_byte} "
+            f"({content_length:,} B / {total_size:,} B)"
+        )
 
         # Send response headers
         if range_header:
@@ -334,27 +364,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             enabled = _proxy_enabled
 
         if not enabled:
-            _log("Proxy disabled by user — direct passthrough")
-            stats.reset(total_size, content_type, clean_url, 1, 0, 0, mode="direct")
-            self._direct_passthrough(final_url, upstream_headers, start_byte, end_byte)
+            log_verbose(TAG, "Mode=DIRECT (proxy toggled OFF by user)")
+            sid = stats.reset(total_size, content_type, clean_url, 1, 0, 0, mode="direct")
+            self._direct_passthrough(final_url, upstream_headers, start_byte, end_byte, sid)
             return
 
         if not probe.supports_ranges:
-            _log("Upstream doesn't support ranges — direct passthrough")
-            stats.reset(total_size, content_type, clean_url, 1, 0, 0, mode="direct")
-            self._direct_passthrough(final_url, upstream_headers, start_byte, end_byte)
+            log_verbose(TAG, "Mode=DIRECT (upstream does not support byte ranges)")
+            sid = stats.reset(total_size, content_type, clean_url, 1, 0, 0, mode="direct")
+            self._direct_passthrough(final_url, upstream_headers, start_byte, end_byte, sid)
             return
 
         # Small read bypass
         if content_length <= small_threshold:
-            _log(f"Small read ({content_length} bytes) — single request")
+            log_verbose(
+                TAG,
+                f"Mode=BYPASS_SMALL ({content_length:,} B <= threshold {small_threshold:,} B)"
+            )
             sid = stats.reset(total_size, content_type, clean_url, 1, chunk_size, 1, mode="bypass_small")
             self._single_range_fetch(final_url, upstream_headers, start_byte, end_byte, sid)
             return
 
         # Full parallel acceleration
-        _log(f"Parallel stream: {content_length} bytes, {threads} threads, "
-             f"{chunk_kb}KB chunks, read_ahead={read_ahead}")
+        log_verbose(
+            TAG,
+            f"Mode=ACCELERATED: {content_length:,} B, threads={threads}, "
+            f"chunk={chunk_kb}KB, read_ahead={read_ahead}, retries={retries}"
+        )
         sid = stats.reset(total_size, content_type, clean_url, threads, chunk_size, read_ahead, mode="accelerated")
 
         streamer = ParallelRangeStream(
@@ -369,12 +405,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
         streamer.set_stream_id(sid)
 
+        bytes_sent = 0
         try:
             for chunk in streamer.stream_chunks():
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                bytes_sent += len(chunk)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            _log("Client disconnected (seek/stop)")
+            log_verbose(
+                TAG,
+                f"Client disconnected (seek/stop) on stream #{sid} after {bytes_sent:,} B"
+            )
             stats.record_seek()
         finally:
             streamer.close()
@@ -384,39 +425,62 @@ class ProxyHandler(BaseHTTPRequestHandler):
         req_headers = headers.copy()
         req_headers["Range"] = f"bytes={start_byte}-{end_byte}"
         resp = None
+        t0 = time.monotonic()
+        sent = 0
         try:
             resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(5, 30))
             for chunk in resp.iter_content(chunk_size=65536):
                 if chunk:
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    sent += len(chunk)
                     stats.record_bytes_delivered(len(chunk))
+            log_verbose(
+                TAG,
+                f"Small read #{stream_id} complete: {sent:,} B in {(time.monotonic()-t0)*1000:.0f}ms"
+            )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            log_verbose(TAG, f"Small read #{stream_id} client disconnected after {sent:,} B")
             stats.record_seek()
         except Exception as e:
-            _log(f"Small read error: {e}")
+            log_warning(TAG, f"Small read #{stream_id} error: {e}")
         finally:
             if resp is not None:
                 resp.close()
             stats.stop(stream_id=stream_id)
 
-    def _direct_passthrough(self, final_url, headers, start_byte, end_byte):
+    def _direct_passthrough(self, final_url, headers, start_byte, end_byte, stream_id):
         stats = StreamStats.instance()
         req_headers = headers.copy()
         req_headers["Range"] = f"bytes={start_byte}-{end_byte}"
         resp = None
+        t0 = time.monotonic()
+        sent = 0
         try:
             resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(5, 60))
             for chunk in resp.iter_content(chunk_size=131072):
                 if chunk:
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    sent += len(chunk)
                     stats.record_bytes_delivered(len(chunk))
+            elapsed = max(0.001, time.monotonic() - t0)
+            mbps = (sent * 8) / (elapsed * 1_000_000)
+            log_verbose(
+                TAG,
+                f"Direct passthrough #{stream_id} finished: {sent:,} B in {elapsed:.1f}s ({mbps:.1f} Mbit/s)"
+            )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            elapsed = max(0.001, time.monotonic() - t0)
+            mbps = (sent * 8) / (elapsed * 1_000_000)
+            log_verbose(
+                TAG,
+                f"Direct passthrough #{stream_id} disconnected: {sent:,} B in {elapsed:.1f}s ({mbps:.1f} Mbit/s)"
+            )
             stats.record_seek()
         except Exception as e:
-            _log(f"Direct passthrough error: {e}")
+            log_warning(TAG, f"Direct passthrough #{stream_id} error: {e}")
         finally:
             if resp is not None:
                 resp.close()
-            stats.stop()
+            stats.stop(stream_id=stream_id)
