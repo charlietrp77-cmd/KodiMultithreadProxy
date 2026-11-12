@@ -5,7 +5,6 @@ messages (probe latency, per-chunk timing, buffer starvation stalls, window
 scheduling) are promoted from LOGDEBUG to LOGINFO so they appear in kodi.log
 without needing Kodi's system-wide Debug Overlay.
 """
-import time
 
 try:
     import xbmc
@@ -14,27 +13,23 @@ try:
 except ImportError:
     _HAS_KODI = False
 
-_verbose_cached = False
-_verbose_last_check = 0.0
-_CACHE_TTL = 2.0
+_verbose_cached = None
 
 
 def refresh_verbose():
-    """Force-refresh verbose setting immediately (e.g. onSettingsChanged)."""
-    global _verbose_cached, _verbose_last_check
-    _verbose_last_check = 0.0
+    """Force-refresh verbose setting (called at startup and onSettingsChanged)."""
+    global _verbose_cached
+    _verbose_cached = None
     return is_verbose()
 
 
 def is_verbose():
-    """Return True if verbose logging is enabled in settings (cached 2s)."""
-    global _verbose_cached, _verbose_last_check
+    """Return True if verbose logging is enabled in settings (cached until settings change)."""
+    global _verbose_cached
     if not _HAS_KODI:
         return False
-    now = time.monotonic()
-    if now - _verbose_last_check < _CACHE_TTL:
+    if _verbose_cached is not None:
         return _verbose_cached
-    _verbose_last_check = now
     try:
         addon = xbmcaddon.Addon("service.stream.accelerator")
         _verbose_cached = addon.getSettingBool("verbose_logging")
@@ -64,3 +59,4 @@ def log_verbose(tag, msg):
         return
     level = xbmc.LOGINFO if is_verbose() else xbmc.LOGDEBUG
     xbmc.log(f"[{tag}] {msg}", level)
+

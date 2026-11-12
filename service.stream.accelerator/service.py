@@ -17,23 +17,29 @@ from resources.lib.server import ProxyHandler
 from resources.lib.logutil import refresh_verbose
 
 # ── Keymap XML content ────────────────────────────────────────────────────────
-# Ctrl+D (key 0x10064 = 65636): Toggle stats overlay
-# Ctrl+Shift+D (key 0x30064 = 196708): Toggle proxy on/off
+# Ctrl+D       (<d mod="ctrl">,       0x1f044): Toggle stats overlay
+# Ctrl+Shift+D (<d mod="ctrl,shift">, 0x3f044): Toggle proxy on/off
 KEYMAP_XML = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <keymap>
     <global>
         <keyboard>
-            <key id="65636">RunScript(service.stream.accelerator,overlay)</key>
-            <key id="196708">RunScript(service.stream.accelerator,toggle)</key>
+            <d mod="ctrl">RunScript(service.stream.accelerator,overlay)</d>
+            <d mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</d>
         </keyboard>
     </global>
     <FullscreenVideo>
         <keyboard>
-            <key id="65636">RunScript(service.stream.accelerator,overlay)</key>
-            <key id="196708">RunScript(service.stream.accelerator,toggle)</key>
+            <d mod="ctrl">RunScript(service.stream.accelerator,overlay)</d>
+            <d mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</d>
         </keyboard>
     </FullscreenVideo>
+    <VideoOSD>
+        <keyboard>
+            <d mod="ctrl">RunScript(service.stream.accelerator,overlay)</d>
+            <d mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</d>
+        </keyboard>
+    </VideoOSD>
 </keymap>
 """
 

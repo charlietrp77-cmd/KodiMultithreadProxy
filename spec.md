@@ -152,7 +152,7 @@ The proxy automatically selects the best strategy per-request:
 | `chunk_size_kb` | Slider | 1024 (1 MB) | 256–8192 | Byte range per worker task |
 | `read_ahead` | Slider | 12 | 2–32 | Max chunks buffered ahead in RAM |
 | `retries` | Slider | 3 | 1–10 | Retry attempts per failed chunk |
-| `small_read_threshold_mb` | Slider | 2 | 1–8 | Below this size, skip threading |
+| `small_read_threshold_mb` | Slider | 4 | 1–8 | Below this size, skip threading |
 | `overlay_enabled` | Bool | `true` | — | Allow Ctrl+D stats overlay hotkey |
 | `verbose_logging` | Bool | `false` | — | Write detailed diagnostics (timings, chunks, stalls) to `kodi.log` at `LOGINFO` without enabling Kodi's debug overlay |
 
@@ -322,13 +322,13 @@ A non-focus-stealing `xbmcgui.WindowDialog` rendered in the top-right corner of 
 
 ### 5G. Hotkey System
 
-| Shortcut | Key ID | Action |
+| Shortcut | Keymap Tag | Action |
 |---|---|---|
-| **Ctrl+D** | 65636 | Toggle the OSD stats overlay on/off |
-| **Ctrl+Shift+D** | 196708 | Toggle proxy acceleration on/off (affects next stream) |
+| **Ctrl+D** | `<d mod="ctrl">` (`0x1f044`) | Toggle the OSD stats overlay on/off |
+| **Ctrl+Shift+D** | `<d mod="ctrl,shift">` (`0x3f044`) | Toggle proxy acceleration on/off (affects next stream) |
 
 **Implementation (Sub-Interpreter IPC):** In Kodi's `XBPython`, `xbmc.service` (`service.py`) and `RunScript()` (`script.py`) run in separate Python sub-interpreters with isolated memory heaps. Therefore:
-1. The service installs a keymap XML to `special://profile/keymaps/accelerator_keymap.xml` on startup and removes it on shutdown.
+1. The service installs a keymap XML to `special://profile/keymaps/accelerator_keymap.xml` (covering `<global>`, `<FullscreenVideo>`, and `<VideoOSD>`) on startup and removes it on shutdown.
 2. Pressing Ctrl+D or Ctrl+Shift+D launches `script.py`, which discovers the active port and sends an HTTP request to `http://127.0.0.1:<port>/control?action=overlay` or `?action=toggle`.
 3. `ProxyHandler._handle_control()` handles the request inside the `service.py` interpreter, where live `StreamStats`, `_proxy_enabled`, and `StatsOverlay` live.
 

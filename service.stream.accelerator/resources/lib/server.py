@@ -37,7 +37,7 @@ _DEFAULTS = {
     "chunk_size_kb": 1024,
     "read_ahead": 12,
     "retries": 3,
-    "small_read_threshold_mb": 2,
+    "small_read_threshold_mb": 4,
 }
 
 # ── Module-level state (lives in the service interpreter) ─────────────────
@@ -424,29 +424,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stats = StreamStats.instance()
         req_headers = headers.copy()
         req_headers["Range"] = f"bytes={start_byte}-{end_byte}"
-        resp = None
         t0 = time.monotonic()
         sent = 0
+        max_attempts = 3
         try:
-            resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(5, 30))
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                    sent += len(chunk)
-                    stats.record_bytes_delivered(len(chunk))
-            log_verbose(
-                TAG,
-                f"Small read #{stream_id} complete: {sent:,} B in {(time.monotonic()-t0)*1000:.0f}ms"
-            )
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            log_verbose(TAG, f"Small read #{stream_id} client disconnected after {sent:,} B")
-            stats.record_seek()
-        except Exception as e:
-            log_warning(TAG, f"Small read #{stream_id} error: {e}")
+            for attempt in range(max_attempts):
+                resp = None
+                try:
+                    resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(4, 8))
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            try:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                                log_verbose(TAG, f"Small read #{stream_id} client disconnected after {sent:,} B")
+                                stats.record_seek()
+                                return
+                            sent += len(chunk)
+                            stats.record_bytes_delivered(len(chunk))
+                    log_verbose(
+                        TAG,
+                        f"Small read #{stream_id} complete: {sent:,} B in {(time.monotonic()-t0)*1000:.0f}ms"
+                    )
+                    return
+                except requests.exceptions.RequestException as e:
+                    if sent == 0 and attempt < max_attempts - 1:
+                        log_warning(
+                            TAG,
+                            f"Small read #{stream_id} attempt {attempt+1}/{max_attempts} stalled/failed ({e}), retrying..."
+                        )
+                        time.sleep(0.2)
+                        continue
+                    log_warning(TAG, f"Small read #{stream_id} upstream error after {sent:,} B: {e}")
+                    return
+                except Exception as e:
+                    log_warning(TAG, f"Small read #{stream_id} error: {e}")
+                    return
+                finally:
+                    if resp is not None:
+                        resp.close()
         finally:
-            if resp is not None:
-                resp.close()
             stats.stop(stream_id=stream_id)
 
     def _direct_passthrough(self, final_url, headers, start_byte, end_byte, stream_id):
@@ -460,8 +478,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             resp = requests.get(final_url, headers=req_headers, stream=True, timeout=(5, 60))
             for chunk in resp.iter_content(chunk_size=131072):
                 if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        elapsed = max(0.001, time.monotonic() - t0)
+                        mbps = (sent * 8) / (elapsed * 1_000_000)
+                        log_verbose(
+                            TAG,
+                            f"Direct passthrough #{stream_id} disconnected: {sent:,} B in {elapsed:.1f}s ({mbps:.1f} Mbit/s)"
+                        )
+                        stats.record_seek()
+                        return
                     sent += len(chunk)
                     stats.record_bytes_delivered(len(chunk))
             elapsed = max(0.001, time.monotonic() - t0)
@@ -470,14 +498,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 TAG,
                 f"Direct passthrough #{stream_id} finished: {sent:,} B in {elapsed:.1f}s ({mbps:.1f} Mbit/s)"
             )
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            elapsed = max(0.001, time.monotonic() - t0)
-            mbps = (sent * 8) / (elapsed * 1_000_000)
-            log_verbose(
-                TAG,
-                f"Direct passthrough #{stream_id} disconnected: {sent:,} B in {elapsed:.1f}s ({mbps:.1f} Mbit/s)"
-            )
-            stats.record_seek()
         except Exception as e:
             log_warning(TAG, f"Direct passthrough #{stream_id} error: {e}")
         finally:

@@ -59,7 +59,7 @@ Open **Add-ons** → **My add-ons** → **Services** → **Multi-Threaded Stream
 | **Chunk Size (KB)** | `1024` (1 MB) | Range: 256 KB – 8192 KB |
 | **Max Read-Ahead Chunks in RAM** | `12` | 12 MB RAM at default chunk size; lower to 6–8 on low-RAM Android boxes |
 | **Chunk Retry Attempts** | `3` | Retries per failed chunk before aborting |
-| **Small Read Bypass Threshold (MB)** | `2` | Requests ≤ threshold skip threading (fast header/cue reads) |
+| **Small Read Bypass Threshold (MB)** | `4` | Requests ≤ threshold skip threading (fast header/cue reads) |
 | **Enable Stats Overlay Hotkey (Ctrl+D)** | `true` | Allows toggling the live OSD overlay |
 | **Enable Verbose Logging** | `false` | Turn **ON** to write detailed diagnostics (probe timing, per-chunk throughput, slow-start, consumer stalls) directly to `kodi.log` **without** enabling Kodi's noisy system-wide debug overlay |
 
@@ -99,3 +99,4 @@ Filter for `[StreamAccelerator` or `plugin.video.easynewsx` to see:
 - Chunk-0 slow-start & window expansion
 - Per-chunk HTTP 206 latency and throughput (`Mbit/s`)
 - Consumer stall warnings (`Consumer stalled Xms waiting for chunk N`) — useful for tuning `threads`, `chunk_size_kb`, and `read_ahead`!
+
