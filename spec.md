@@ -1,323 +1,575 @@
-1. Verification: Does a Standalone Add-on Already Exist?No, a standalone, reusable Kodi service add-on for multi-threaded HTTP byte-range streaming does not exist.A check of existing Kodi repositories, GitHub projects, and forum history shows how current solutions fall short:script.module.slyguy & service.proxy: Run a local 127.0.0.1 Python proxy inside Kodi to modify HLS/DASH manifests, inject headers, and handle DNS overwrites, but they forward upstream media segments using single-threaded connections.inputstream.ffmpegdirect & inputstream.adaptive: Written in C++ for adaptive manifest parsing and timeshifting, they open a single connection per segment or stream via libcurl or FFmpeg's libavformat.Historical Forum Attempts: Users have requested multi-threaded HTTP/FTP acceleration inside Kodi since 2014 (e.g., trying to wrap external Linux binaries like axel or aria2 as a MITM proxy), and older scripts like F4mProxy or VeohProxy handled custom chunkstitching, but nobody has packaged a clean, universal, multi-threaded HTTP Byte-Range Accelerator (xbmc.service + script.module) that splits a single slow single-connection stream (like Easynews or throttled Debrid routes) into $N$ parallel range connections in RAM.2. Complete Architecture & Design Plan: service.stream.acceleratorTo make this add-on universal (usable by your own add-ons, TMDbHelper players, .strm files, or patched scrapers like POV/Fen Light/KodiStremioBridge), we design it as a dual-extension Kodi add-on:xbmc.service: Runs the background multi-threaded proxy server on 127.0.0.1.xbmc.python.module: Exposes a 1-line helper function so any other Kodi add-on can wrap a URL with import stream_accelerator; url = stream_accelerator.proxify(raw_url).Directory StructurePlaintextservice.stream.accelerator/
-├── addon.xml
-├── service.py                  # Entry point for xbmc.service (starts/stops HTTP server)
-├── resources/
-│   ├── settings.xml            # GUI settings for Threads, Chunk Size, Port, Buffer Limits
-│   └── lib/
-│       ├── __init__.py
-│       ├── client.py           # Helper module imported by other add-ons
-│       ├── server.py           # ThreadingHTTPServer & HTTP 206 Range Handler
-│       └── engine.py           # Sliding-Window Parallel Chunk Downloader & RAM Buffer
-3. Component Design SpecificationsA. Configuration (resources/settings.xml)The add-on exposes four core tunables in the Kodi GUI (and allows overriding them dynamically per-URL via query parameters):threads (Int, Default: 6, Range: 1–16): Number of concurrent HTTP worker threads per active stream.chunk_size_kb (Int, Default: 1024 KB / 1 MB, Range: 256 KB – 8192 KB): Exact byte range (Range: bytes=start-end) requested per worker task.read_ahead_chunks (Int, Default: 12): Maximum number of chunks allowed in the RAM ring buffer ahead of Kodi's current read pointer (prevents Out-Of-Memory crashes on Android TV). With 1 MB chunks and 12 read-ahead, peak RAM footprint is strictly capped at 12 MB.port (Int, Default: 48990): Localhost binding port (127.0.0.1).B. Universal URL Interface (How Other Add-ons Use It)Any add-on or .strm file can route traffic through the proxy simply by passing the target URL (and optional Kodi |Header=Value pipe headers) to the local endpoint:Plaintexthttp://127.0.0.1:48990/stream?url=<urlencoded_target_url>&threads=8&chunk_kb=2048
-Header Extraction: In Kodi, URLs often look like https://host/video.mkv|User-Agent=Mozilla&Authorization=Basic.... The proxy automatically strips the | suffix from the URL and injects those exact headers into every upstream worker thread request.Dynamic Override: If threads or chunk_kb are omitted from the URL, the proxy falls back to the user's configured values in settings.xml.C. The Streaming Engine (engine.py) — How Seeking & Buffering WorkKodi’s VideoPlayer (ffmpeg) does not just read a file linearly from byte 0 to the end. On MKV/MP4 start-up, Kodi:Sends an initial GET with Range: bytes=0- to read the file header.Immediately aborts and sends a second GET with Range: bytes=<near_eof>- to read the MKV Cues / MP4 moov atom (index table) at the very end of the file.Aborts again and jumps back to Range: bytes=<audio/video_start>- to begin actual playback.If your proxy blindly spawns 8 threads from byte 0 on step 1, it wastes bandwidth and stalls step 2. Our engine solves this with a Sliding-Window Coordinator:Kodi Player (Consumer) 
+# service.stream.accelerator — Complete Specification
+
+> Multi-threaded HTTP byte-range streaming proxy for Kodi.
+> **Version:** 1.0.0 · **Status:** Implementation Complete · **Repo:** [github.com/charlietrp77-cmd/KodiMultithreadProxy](https://github.com/charlietrp77-cmd/KodiMultithreadProxy)
+
+---
+
+## Table of Contents
+
+1. [Background & Motivation](#1-background--motivation)
+2. [Architecture Overview](#2-architecture-overview)
+3. [Directory Structure](#3-directory-structure)
+4. [Provider Compatibility](#4-provider-compatibility)
+5. [Component Design](#5-component-design)
+   - 5A. [Configuration (settings.xml)](#5a-configuration)
+   - 5B. [Universal URL Interface](#5b-universal-url-interface)
+   - 5C. [Upstream Probe (server.py)](#5c-upstream-probe)
+   - 5D. [Streaming Engine (engine.py)](#5d-streaming-engine)
+   - 5E. [Stats Collector (stats.py)](#5e-stats-collector)
+   - 5F. [OSD Overlay (overlay.py)](#5f-osd-stats-overlay)
+   - 5G. [Hotkey System](#5g-hotkey-system)
+   - 5H. [Service Lifecycle (service.py)](#5h-service-lifecycle)
+   - 5I. [Client Helper (__init__.py)](#5i-client-helper)
+6. [Request Flow — How a Stream Works End-to-End](#6-request-flow)
+7. [Design Decisions & Fixes Applied](#7-design-decisions--fixes-applied)
+8. [Testing & A/B Comparison](#8-testing--ab-comparison)
+9. [Integration Guide](#9-integration-guide)
+10. [Complete Implementation Reference](#10-complete-implementation-reference)
+
+---
+
+## 1. Background & Motivation
+
+No standalone, reusable Kodi service add-on for multi-threaded HTTP byte-range streaming exists. Existing solutions fall short:
+
+| Existing Solution | What It Does | Why It's Not Enough |
+|---|---|---|
+| **script.module.slyguy / service.proxy** | Local 127.0.0.1 Python proxy for HLS/DASH manifest modification, header injection, DNS overwrites | Single-threaded upstream connections |
+| **inputstream.ffmpegdirect** | C++ adaptive manifest parsing, timeshifting | Single connection per segment via libcurl |
+| **inputstream.adaptive** | DASH/HLS/Smooth adaptive streaming | Single connection per segment |
+| **Historical attempts (F4mProxy, VeohProxy, axel/aria2 wrappers)** | Custom chunk stitching, external binary wrappers | Never packaged as clean reusable Kodi addon |
+
+**The gap:** Nobody has built a clean `xbmc.service + xbmc.python.module` that splits a single slow HTTP stream (Easynews, throttled Debrid routes, WebDAV) into N parallel byte-range connections in RAM.
+
+---
+
+## 2. Architecture Overview
+
+The add-on is a **triple-extension** Kodi package:
+
+| Extension Point | Purpose |
+|---|---|
+| `xbmc.service` | Background daemon — starts the HTTP proxy on `127.0.0.1` at Kodi login |
+| `xbmc.python.module` | Importable `proxify()` helper for other add-ons |
+| `xbmc.python.script` | `RunScript()` entry point for hotkey actions (overlay, toggle) |
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Kodi VideoPlayer (ffmpeg)                                       │
+│  Sends: GET /stream?url=<upstream> with Range: bytes=X-Y         │
+└────────────────────────┬─────────────────────────────────────────┘
+                         │ HTTP on 127.0.0.1:48990
+                         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  ProxyHandler (server.py)                                        │
+│  ┌──────────────┐  ┌───────────────┐  ┌────────────────────────┐ │
+│  │ Upstream      │  │ Small-Read    │  │ Direct Passthrough     │ │
+│  │ Probe (HEAD+  │  │ Bypass        │  │ (when proxy disabled   │ │
+│  │ GET fallback) │  │ (< 2MB)       │  │  or no range support)  │ │
+│  └──────┬───────┘  └───────┬───────┘  └───────────┬────────────┘ │
+│         │                  │                      │              │
+│         ▼                  │                      │              │
+│  ┌──────────────────────┐  │                      │              │
+│  │ ParallelRangeStream  │◄─┘  (if content_length  │              │
+│  │ (engine.py)          │      > threshold)        │              │
+│  │                      │                          │              │
+│  │ ThreadPoolExecutor   │                          │              │
+│  │  ├─ Worker 1: GET Range: bytes=0-1048575        │              │
+│  │  ├─ Worker 2: GET Range: bytes=1048576-2097151  │              │
+│  │  ├─ Worker 3: ...                               │              │
+│  │  └─ Worker N                                    │              │
+│  │                      │                          │              │
+│  │ Ordered RAM Buffer   │                          │              │
+│  │ [chunk_0][chunk_1]...[chunk_N]                  │              │
+│  └──────────┬───────────┘                          │              │
+│             │                                      │              │
+│             ▼                                      ▼              │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  StreamStats singleton ◄──── OSD Overlay (Ctrl+D)           │ │
+│  │  (stats.py)                  (overlay.py)                   │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Directory Structure
+
+```
+service.stream.accelerator/
+├── addon.xml                   # Triple extension: service + module + script
+├── service.py                  # xbmc.service entry — daemon lifecycle, keymap install
+├── script.py                   # xbmc.python.script — RunScript() hotkey handler
+└── resources/
+    ├── settings.xml            # GUI settings (threads, chunk size, port, buffer, threshold)
+    └── lib/
+        ├── __init__.py         # proxify() helper — importable by other add-ons
+        ├── stats.py            # Thread-safe StreamStats singleton (metrics collector)
+        ├── engine.py           # ParallelRangeStream — sliding-window chunk downloader
+        ├── server.py           # ProxyHandler — HTTP 206 range server + upstream probe
+        └── overlay.py          # StatsOverlay — OSD window + toggle functions
+```
+
+---
+
+## 4. Provider Compatibility
+
+The proxy has been designed to handle the specific behaviors of these providers:
+
+| Provider | Range Support | Redirect Behavior | Token Lifetime | Proxy Strategy |
+|:---|:---:|:---|:---|:---|
+| **Easynews** | ✅ 206 | Single 302 → CDN | Session-based (long) | Full acceleration. May rate-limit excessive parallelism; default 6 threads is safe. |
+| **Premiumize.me** | ✅ 206 | 302 → CDN edge | URL-token, ~hours | Full acceleration. CDN handles parallel ranges well. |
+| **TorBox** | ✅ 206 | 302 → **single-use token** | Short-lived | **Critical:** Redirect must be resolved once during probe and the final URL reused by all workers. Implemented in `probe_upstream()`. |
+| **Real-Debrid** | ✅ 206 | 302 → CDN | URL-token, ~hours | Full acceleration. Max ~16 connections recommended. |
+| **AllDebrid** | ✅ 206 | 302 → CDN | URL-token | Similar to Premiumize. |
+| **WebDAV** | Varies | Usually direct | N/A | Auto-detected: if no range support, falls back to direct passthrough. |
+| **Generic HTTP** | Varies | Varies | Varies | HEAD+GET dual probe determines capability; automatic fallback. |
+
+### Automatic Fallback Modes
+
+The proxy automatically selects the best strategy per-request:
+
+1. **Accelerated** — Full parallel threading (when ranges supported and content > threshold)
+2. **Small-Read Bypass** — Single direct request (when content ≤ 2 MB, e.g. MKV header/cue reads)
+3. **Direct Passthrough** — Single-connection pipe (when proxy disabled by user, or upstream doesn't support ranges)
+
+---
+
+## 5. Component Design
+
+### 5A. Configuration
+
+**File:** `resources/settings.xml`
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `port` | Int | 48990 | — | Localhost binding port |
+| `threads` | Slider | 6 | 1–16 | Concurrent HTTP workers per stream |
+| `chunk_size_kb` | Slider | 1024 (1 MB) | 256–8192 | Byte range per worker task |
+| `read_ahead` | Slider | 12 | 2–32 | Max chunks buffered ahead in RAM |
+| `retries` | Slider | 3 | 1–10 | Retry attempts per failed chunk |
+| `small_read_threshold_mb` | Slider | 2 | 1–8 | Below this size, skip threading |
+
+**RAM footprint:** With defaults (1 MB chunks × 12 read-ahead), peak RAM is capped at **12 MB**. On Android TV with limited RAM, reduce `read_ahead` to 6–8.
+
+All settings except `port` can be overridden per-URL via query parameters (`threads`, `chunk_kb`, `read_ahead`).
+
+### 5B. Universal URL Interface
+
+Any add-on, `.strm` file, or player can route traffic through the proxy:
+
+```
+http://127.0.0.1:48990/stream?url=<urlencoded_target_url>&threads=8&chunk_kb=2048
+```
+
+**Kodi pipe-header extraction:** URLs like `https://host/video.mkv|User-Agent=Mozilla&Authorization=Basic...` are automatically parsed. The `|` suffix is stripped from the URL, and the key-value pairs are injected as HTTP headers into every upstream request.
+
+**Dynamic override:** If `threads` or `chunk_kb` are omitted, the proxy uses the user's values from `settings.xml`.
+
+### 5C. Upstream Probe
+
+**File:** `resources/lib/server.py` → `probe_upstream()`
+
+Before serving any request, the proxy probes the upstream server to determine file size, content type, final URL (post-redirect), and range support. This uses a **two-phase strategy**:
+
+**Phase 1 — HEAD request** (cheapest, no body transfer):
+```
+HEAD https://upstream.example/video.mkv
+→ Content-Length: 4294967296
+→ Accept-Ranges: bytes
+→ (follow redirects → capture resp.url as final_url)
+```
+
+If HEAD returns both `Content-Length` and `Accept-Ranges: bytes`, we're done.
+
+**Phase 2 — GET with `Range: bytes=0-0`** (fallback):
+```
+GET https://upstream.example/video.mkv
+Range: bytes=0-0
+→ 206 Partial Content
+→ Content-Range: bytes 0-0/4294967296
+```
+
+If this returns `206`, we confirm range support and extract the total size from `Content-Range`. If it returns `200`, the server doesn't support ranges — we fall back to direct passthrough.
+
+**Critical: Redirect resolution** — The probe captures `resp.url` (the final URL after all 301/302 redirects) and passes this resolved URL to all worker threads. This prevents redirect amplification where N threads each independently follow redirects, which breaks providers with single-use redirect tokens (notably TorBox).
+
+### 5D. Streaming Engine
+
+**File:** `resources/lib/engine.py` → `ParallelRangeStream`
+
+#### How Kodi reads files (and why naive parallelism breaks)
+
+Kodi's VideoPlayer (ffmpeg) doesn't read linearly from byte 0. On MKV/MP4 startup, it:
+
+1. `GET Range: bytes=0-` → reads file header (a few KB)
+2. **Immediately aborts** → `GET Range: bytes=<near_eof>-` → reads MKV Cues / MP4 moov atom at the end
+3. **Aborts again** → `GET Range: bytes=<audio_start>-` → begins actual playback
+
+If the proxy blindly spawned 6 threads from byte 0 on step 1, it would waste bandwidth and block step 2. The engine solves this with:
+
+#### Small-Read Bypass
+
+Requests where `content_length ≤ small_read_threshold` (default 2 MB) are served by a single direct HTTP request — no thread pool, no buffer overhead. This handles the header/cue reads in steps 1 and 2 with minimal latency.
+
+#### Sliding-Window Coordinator (for large reads)
+
+```
+Kodi Player (Consumer)
    │  Reads sequential bytes from current offset
    ▼
-[ Ordered RAM Ring Buffer (Max: N Chunks) ]
-   ▲  Workers deposit completed chunks by index: buffer[chunk_id] = bytes
+[ Ordered RAM Buffer: {chunk_0: bytes, chunk_1: bytes, ...} ]
+   ▲  Workers deposit completed chunks by index
    │
-[ ThreadPoolExecutor (Configurable: e.g., 6 Threads) ]
-   ├── Worker 1: GET Range: bytes=0 - 1048575
-   ├── Worker 2: GET Range: bytes=1048576 - 2097151
-   ├── Worker 3: GET Range: bytes=2097152 - 3145727
+[ ThreadPoolExecutor (e.g., 6 threads) ]
+   ├── Worker 1: GET Range: bytes=0-1048575
+   ├── Worker 2: GET Range: bytes=1048576-2097151
+   ├── Worker 3: GET Range: bytes=2097152-3145727
    └── ...
-Upstream Probe (HEAD / Range: bytes=0-0):When Kodi connects, the proxy makes a fast Range: bytes=0-0 request to the upstream server to extract the total file size from Content-Range: bytes 0-0/TOTAL_SIZE and the Content-Type.It immediately replies to Kodi with HTTP/1.1 206 Partial Content, Accept-Ranges: bytes, Content-Length, and Content-Range.Small Read Bypass (Instant MKV Header/Footer Seeking):If the remaining byte range requested by Kodi is smaller than a single chunk (e.g., reading the last 64 KB of an MKV for seeking cues), the proxy fetches it in a single direct request without spinning up the thread pool.Sliding-Window Backpressure:Let current_chunk be the chunk Kodi is currently waiting to read.The scheduler only dispatches worker tasks for chunk_id in [current_chunk ... current_chunk + read_ahead_chunks].As soon as buffer[current_chunk] completes, the handler writes it to Kodi’s socket (self.wfile.write()), deletes buffer[current_chunk] from RAM to free memory immediately, increments current_chunk, and schedules current_chunk + read_ahead_chunks in the ThreadPoolExecutor.Instant Abort on Seek:When you press Fast-Forward in Kodi, Kodi closes the current TCP socket and opens a new one at the new byte offset.Catching BrokenPipeError / ConnectionResetError immediately sets an abort_event = threading.Event(), cancelling all pending futures in the pool and purging the RAM dictionary in milliseconds so the new seek offset gets 100% of the threads.4. Complete Reference ImplementationBelow are the core files ready to drop into a service.stream.accelerator folder.1. addon.xmlXML<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="service.stream.accelerator" name="Multi-Threaded Stream Accelerator" version="1.0.0" provider-name="Custom">
-    <requires>
-        <import addon="xbmc.python" version="3.0.0"/>
-        <import addon="script.module.requests" version="2.25.1"/>
-    </requires>
+```
 
-    <!-- Background Proxy Daemon -->
-    <extension point="xbmc.service" library="service.py" start="login"/>
+**Backpressure control:**
+- Let `current_chunk` = the chunk Kodi is currently waiting to read
+- The scheduler only dispatches work for `chunk_id ∈ [current_chunk, current_chunk + read_ahead)`
+- When `buffer[current_chunk]` completes, the handler writes it to Kodi's socket, **deletes it from RAM immediately**, increments `current_chunk`, and schedules `current_chunk + read_ahead` into the executor
 
-    <!-- Importable Helper Module for other Add-ons -->
-    <extension point="xbmc.python.module" library="resources/lib"/>
+**Instant Abort on Seek:**
+- When Kodi seeks (fast-forward, chapter skip), it closes the TCP socket → triggers `BrokenPipeError` / `ConnectionResetError`
+- The handler sets `abort_event` (a `threading.Event`), which:
+  - Causes all in-flight workers to exit early on their next check
+  - Cancels queued futures via `executor.shutdown(cancel_futures=True)`
+  - Clears the RAM buffer immediately
+- Kodi then opens a new connection at the new byte offset and gets 100% of the threads
 
-    <extension point="xbmc.addon.metadata">
-        <summary lang="en_GB">Local multi-threaded HTTP byte-range streaming proxy</summary>
-        <description lang="en_GB">Accelerates single-stream HTTP sources (Easynews, Debrid, WebDAV) using parallel chunked byte-range requests in RAM.</description>
-        <platform>all</platform>
-    </extension>
-</addon>
-2. resources/settings.xmlXML<?xml version="1.0" encoding="utf-8" standalone="yes"?>
-<settings>
-    <category label="Proxy Engine">
-        <setting id="port" type="number" label="Local Proxy Port" default="48990"/>
-        <setting id="threads" type="slider" label="Worker Threads per Stream" default="6" range="1,1,16" option="int"/>
-        <setting id="chunk_size_kb" type="slider" label="Chunk Size (KB)" default="1024" range="256,256,8192" option="int"/>
-        <setting id="read_ahead" type="slider" label="Max Read-Ahead Chunks in RAM" default="12" range="2,1,32" option="int"/>
-        <setting id="retries" type="slider" label="Chunk Retry Attempts" default="3" range="1,1,10" option="int"/>
-    </category>
-</settings>
-3. resources/lib/engine.py (The Multi-Threaded Sliding-Window Engine)Pythonimport threading
-import time
-import requests
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import parse_qsl
+#### Safety: Only HTTP 206 accepted
 
+Workers **reject** `200` responses. If the upstream ignores the `Range` header and returns `200` (the full file), accepting it would mean every thread downloads the entire file — causing immediate OOM. Instead, the engine marks the stream as failed and logs a clear error.
 
-def parse_kodi_url(raw_url):
-    """Splits a Kodi URL|Header1=Val1&Header2=Val2 into (clean_url, headers_dict)."""
-    if "|" not in raw_url:
-        return raw_url, {}
-    clean_url, header_str = raw_url.split("|", 1)
-    headers = dict(parse_qsl(header_str))
-    return clean_url, headers
+### 5E. Stats Collector
 
+**File:** `resources/lib/stats.py` → `StreamStats`
 
-class ParallelRangeStream:
-    def __init__(self, url, start_byte, end_byte, threads=6, chunk_size=1048576, read_ahead=12, retries=3):
-        self.clean_url, self.headers = parse_kodi_url(url)
-        self.start_byte = start_byte
-        self.end_byte = end_byte  # Inclusive
-        self.threads = max(1, int(threads))
-        self.chunk_size = max(65536, int(chunk_size))
-        self.read_ahead = max(self.threads, int(read_ahead))
-        self.retries = int(retries)
+A thread-safe singleton that the engine writes to and the overlay reads from:
 
-        self.abort_event = threading.Event()
-        self.condition = threading.Condition()
-        self.buffer = {}       # {chunk_index: bytes}
-        self.in_flight = set() # {chunk_index}
-        self.failed = False
+| Metric | Type | Updated By |
+|---|---|---|
+| `active` | bool | engine start/stop |
+| `enabled` | bool | user toggle (Ctrl+Shift+D) |
+| `mode` | str | server.py ("accelerated" / "direct" / "bypass_small") |
+| `file_size` | int | probe |
+| `content_type` | str | probe |
+| `bytes_delivered` | int | each chunk write / passthrough write |
+| `chunks_completed` | int | each successful chunk |
+| `chunks_failed` | int | exhausted retries |
+| `chunks_retried` | int | each retry attempt |
+| `active_workers` | int | schedule_window / fetch completion |
+| `buffer_fill` | int | schedule_window / chunk pop |
+| `buffer_max` | int | read_ahead setting |
+| `seeks` | int | each BrokenPipe/ConnectionReset |
+| `_speed_samples` | deque | rolling 5-second window of (timestamp, bytes) |
 
-        self.total_chunks = ((self.end_byte - self.start_byte) // self.chunk_size) + 1
-        self.next_chunk_to_yield = 0
+**Derived metrics:**
+- `get_speed_mbps()` — live speed from rolling 5s window, in Mbit/s
+- `get_avg_speed_mbps()` — average speed since stream start
+- `get_elapsed()` — seconds since stream start
 
-        # Persistent session for TCP/TLS connection pooling across workers
-        self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=self.threads,
-            pool_maxsize=self.threads * 2
-        )
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-        self.executor = ThreadPoolExecutor(max_workers=self.threads)
+### 5F. OSD Stats Overlay
 
-    def _fetch_chunk(self, chunk_idx):
-        c_start = self.start_byte + (chunk_idx * self.chunk_size)
-        c_end = min(c_start + self.chunk_size - 1, self.end_byte)
-        req_headers = self.headers.copy()
-        req_headers["Range"] = f"bytes={c_start}-{c_end}"
+**File:** `resources/lib/overlay.py` → `StatsOverlay`
 
-        for attempt in range(self.retries):
-            if self.abort_event.is_set():
-                return
-            try:
-                resp = self.session.get(
-                    self.clean_url,
-                    headers=req_headers,
-                    stream=True,
-                    timeout=(5, 15)
-                )
-                if resp.status_code in (200, 206):
-                    data = resp.content
-                    with self.condition:
-                        if not self.abort_event.is_set():
-                            self.buffer[chunk_idx] = data
-                        self.in_flight.discard(chunk_idx)
-                        self.condition.notify_all()
-                    return
-            except Exception:
-                time.sleep(0.2 * (attempt + 1))
+A `xbmcgui.WindowDialog` rendered in the top-right corner of the screen (1080p). Updates every 500ms via a background thread.
 
-        # If all retries exhausted
-        with self.condition:
-            self.failed = True
-            self.in_flight.discard(chunk_idx)
-            self.condition.notify_all()
+```
+┌──────────────────────────────────────┐
+│  ⚡ Stream Accelerator               │
+│  ● PROXY ACTIVE — ACCELERATED       │  ← Green when active
+│  ──────────────────────────────────  │     Orange when disabled
+│  Speed (live):   42.3 Mbit/s        │  ← Color-coded: green/yellow/red
+│  Speed (avg):    38.7 Mbit/s        │
+│  Workers:        5 / 6 active       │
+│  Buffer:         8 / 12 chunks (67%)│  ← Color-coded fill level
+│  Delivered:      847.3 MB / 4.1 GB  │
+│  Chunks:         823 OK / 0 FAILED  │
+│  Seeks/aborts:   2                  │
+│  Elapsed:        3:42               │
+│  video/x-matroska | 1024KB | 6T     │
+└──────────────────────────────────────┘
+```
 
-    def _schedule_window(self):
-        """Schedules chunks within [next_chunk_to_yield, next_chunk_to_yield + read_ahead]."""
-        window_limit = min(self.total_chunks, self.next_chunk_to_yield + self.read_ahead)
-        for idx in range(self.next_chunk_to_yield, window_limit):
-            if idx not in self.buffer and idx not in self.in_flight:
-                self.in_flight.add(idx)
-                self.executor.submit(self._fetch_chunk, idx)
+**Status modes displayed:**
+- `● PROXY ACTIVE — ACCELERATED` (green) — full parallel streaming
+- `● SMALL READ BYPASS (direct)` (green) — single request for tiny reads
+- `○ PROXY DISABLED — next stream goes direct` (orange) — user toggled off
+- `◌ IDLE — no active stream` (gray) — proxy running but nothing playing
 
-    def stream_chunks(self):
-        """Generator that yields ordered chunks to Kodi's socket and frees RAM immediately."""
-        try:
-            with self.condition:
-                self._schedule_window()
+**Speed color coding:**
+- ≥ 20 Mbit/s → 🟢 Green
+- 5–20 Mbit/s → 🟡 Yellow
+- < 5 Mbit/s → 🔴 Red
 
-            while self.next_chunk_to_yield < self.total_chunks and not self.abort_event.is_set():
-                with self.condition:
-                    while (
-                        self.next_chunk_to_yield not in self.buffer
-                        and not self.failed
-                        and not self.abort_event.is_set()
-                    ):
-                        self.condition.wait(timeout=1.0)
+### 5G. Hotkey System
 
-                    if self.abort_event.is_set() or self.failed:
-                        break
+| Shortcut | Key ID | Action |
+|---|---|---|
+| **Ctrl+D** | 65636 | Toggle the OSD stats overlay on/off |
+| **Ctrl+Shift+D** | 196708 | Toggle proxy acceleration on/off (affects next stream) |
 
-                    # Pop chunk from RAM buffer to keep memory bounded
-                    chunk_data = self.buffer.pop(self.next_chunk_to_yield)
-                    self.next_chunk_to_yield += 1
-                    self._schedule_window()
+**Implementation:** The service installs a keymap XML to `special://profile/keymaps/accelerator_keymap.xml` on startup and removes it on shutdown. The keymap triggers `RunScript(service.stream.accelerator, overlay)` or `RunScript(service.stream.accelerator, toggle)`, which are handled by `script.py` → dispatched to `overlay.py` functions.
 
-                yield chunk_data
-        finally:
-            self.close()
+**Toggle behavior:**
+- Flips `StreamStats.instance().enabled`
+- Shows a Kodi notification: "Proxy ON — next stream will be accelerated" or "Proxy OFF — next stream goes direct"
+- Does **not** affect a currently-playing stream (the active `ParallelRangeStream` continues)
+- The next `/stream` request checks `stats.enabled` and routes to either the parallel engine or direct passthrough
 
-    def close(self):
-        self.abort_event.set()
-        with self.condition:
-            self.buffer.clear()
-            self.condition.notify_all()
-        self.executor.shutdown(wait=False)
-        self.session.close()
-4. resources/lib/server.py (HTTP 206 Range Server)Pythonimport re
-import requests
-import xbmcaddon
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
-from .engine import ParallelRangeStream, parse_kodi_url
+### 5H. Service Lifecycle
 
-RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
+**File:** `service.py` → `AcceleratorService(xbmc.Monitor)`
 
+1. **Startup** (`start="login"`):
+   - Reads port from settings
+   - Creates `ThreadingHTTPServer` on `127.0.0.1:<port>`
+   - **Port-in-use handling:** If the port is taken (previous un-killed instance, conflict), catches `OSError` and tries `port + 1` as fallback. Logs a clear error if both fail.
+   - Starts server in a daemon thread
+   - Installs hotkey keymap → triggers `Action(reloadkeymaps)`
 
-class ProxyHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+2. **Running:**
+   - `waitForAbort()` — blocks until Kodi exits
 
-    def log_message(self, format, *args):
-        pass  # Silence noisy per-request HTTP logs in kodi.log
+3. **Shutdown:**
+   - Removes hotkey keymap
+   - `server.shutdown()` + `server.server_close()`
 
-    def _get_upstream_info(self, raw_url):
-        clean_url, headers = parse_kodi_url(raw_url)
-        probe_headers = headers.copy()
-        probe_headers["Range"] = "bytes=0-0"
-        resp = requests.get(clean_url, headers=probe_headers, stream=True, timeout=10)
-        content_type = resp.headers.get("Content-Type", "video/mp4")
+### 5I. Client Helper
 
-        if "Content-Range" in resp.headers:
-            # Format: bytes 0-0/12345678
-            total_size = int(resp.headers["Content-Range"].split("/")[-1])
-        else:
-            total_size = int(resp.headers.get("Content-Length", 0))
-        resp.close()
-        return total_size, content_type
+**File:** `resources/lib/__init__.py` → `proxify()`
 
-    def do_HEAD(self):
-        self._handle_request(send_body=False)
+One-line URL wrapper for other add-ons:
 
-    def do_GET(self):
-        self._handle_request(send_body=True)
-
-    def _handle_request(self, send_body=True):
-        parsed = urlparse(self.path)
-        if parsed.path != "/stream":
-            self.send_error(404)
-            return
-
-        params = parse_qs(parsed.query)
-        if "url" not in params:
-            self.send_error(400, "Missing url parameter")
-            return
-
-        target_url = unquote(params["url"][0])
-        addon = xbmcaddon.Addon("service.stream.accelerator")
-
-        threads = int(params.get("threads", [addon.getSetting("threads") or 6])[0])
-        chunk_kb = int(params.get("chunk_kb", [addon.getSetting("chunk_size_kb") or 1024])[0])
-        read_ahead = int(params.get("read_ahead", [addon.getSetting("read_ahead") or 12])[0])
-        retries = int(addon.getSetting("retries") or 3)
-        chunk_size = chunk_kb * 1024
-
-        try:
-            total_size, content_type = self._get_upstream_info(target_url)
-        except Exception as e:
-            self.send_error(502, f"Upstream probe failed: {e}")
-            return
-
-        # Parse Range header from Kodi's VideoPlayer
-        range_header = self.headers.get("Range")
-        start_byte = 0
-        end_byte = total_size - 1
-
-        if range_header:
-            match = RANGE_RE.search(range_header)
-            if match:
-                start_byte = int(match.group(1))
-                if match.group(2):
-                    end_byte = min(int(match.group(2)), total_size - 1)
-
-        content_length = (end_byte - start_byte) + 1
-
-        self.send_response(206 if range_header else 200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{total_size}")
-        self.send_header("Content-Length", str(content_length))
-        self.send_header("Connection", "close")
-        self.end_headers()
-
-        if not send_body:
-            return
-
-        streamer = ParallelRangeStream(
-            url=target_url,
-            start_byte=start_byte,
-            end_byte=end_byte,
-            threads=threads,
-            chunk_size=chunk_size,
-            read_ahead=read_ahead,
-            retries=retries,
-        )
-
-        try:
-            for chunk in streamer.stream_chunks():
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            # Normal behavior when Kodi seeks to another byte offset
-            pass
-        finally:
-            streamer.close()
-5. service.py (Kodi Lifecycle Management)Pythonimport threading
-import xbmc
-import xbmcaddon
-from resources.lib.server import ThreadingHTTPServer, ProxyHandler
-
-
-class AcceleratorService(xbmc.Monitor):
-    def __init__(self):
-        super().__init__()
-        addon = xbmcaddon.Addon("service.stream.accelerator")
-        self.port = int(addon.getSetting("port") or 48990)
-        ThreadingHTTPServer.allow_reuse_address = True
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), ProxyHandler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    def run(self):
-        self.thread.start()
-        xbmc.log(f"[StreamAccelerator] Listening on 127.0.0.1:{self.port}", xbmc.LOGINFO)
-        self.waitForAbort()
-        self.server.shutdown()
-        self.server.server_close()
-        xbmc.log("[StreamAccelerator] Service stopped cleanly.", xbmc.LOGINFO)
-
-
-if __name__ == "__main__":
-    AcceleratorService().run()
-6. resources/lib/__init__.py (1-Line Helper for Any Add-on)Pythonfrom urllib.parse import quote
+```python
+from urllib.parse import quote
 import xbmcaddon
 
-
-def proxify(url, threads=None, chunk_kb=None):
-    """Wraps any Kodi stream URL (including |Header=Val) into a local accelerated URL."""
+def proxify(url, threads=None, chunk_kb=None, read_ahead=None):
+    """Wraps any Kodi stream URL into a local accelerated URL."""
     addon = xbmcaddon.Addon("service.stream.accelerator")
     port = addon.getSetting("port") or "48990"
     proxy_url = f"http://127.0.0.1:{port}/stream?url={quote(url, safe='')}"
-    if threads:
+    if threads is not None:
         proxy_url += f"&threads={int(threads)}"
-    if chunk_kb:
+    if chunk_kb is not None:
         proxy_url += f"&chunk_kb={int(chunk_kb)}"
+    if read_ahead is not None:
+        proxy_url += f"&read_ahead={int(read_ahead)}"
     return proxy_url
-How You Use It Across Different Add-onsOnce service.stream.accelerator is installed in Kodi:In Any Custom Add-on (KodiStremioBridge, POV, Fen Light, etc.):
-Add <import addon="service.stream.accelerator"/> to its addon.xml, and right before xbmcplugin.setResolvedUrl, wrap the resolved link:Pythonimport resources.lib as accelerator  # or via standard module path
-resolved_url = accelerator.proxify(resolved_url, threads=8, chunk_kb=1024)
-Without Even Importing the Module:
-Any script or player can simply string-format the localhost URL directly:[http://127.0.0.1:48990/stream?url=](http://127.0.0.1:48990/stream?url=)<urllib.parse.quote(raw_url)>
+```
+
+---
+
+## 6. Request Flow
+
+End-to-end flow for a single Kodi playback session:
+
+```
+1. User plays a proxied URL:
+   http://127.0.0.1:48990/stream?url=https%3A%2F%2Feasynews.example%2Fvideo.mkv
+
+2. ProxyHandler._handle_request():
+   a. Parse query params → extract target URL, settings overrides
+   b. parse_kodi_url() → split pipe headers (once)
+   c. Check StreamStats.enabled → if False, go to direct passthrough
+
+3. probe_upstream(clean_url, headers):
+   a. HEAD request → capture Content-Length, Accept-Ranges, final_url
+   b. If incomplete → GET Range: bytes=0-0 → check for 206, extract Content-Range
+   c. If total_size=0 → raise ValueError (502 to Kodi)
+   d. If 200 returned (no range support) → mark supports_ranges=False
+
+4. Routing decision:
+   a. If !supports_ranges → direct passthrough
+   b. If content_length ≤ 2MB → single_range_fetch (small-read bypass)
+   c. Else → ParallelRangeStream (full acceleration)
+
+5. ParallelRangeStream.stream_chunks():
+   a. Calculate total_chunks from byte range and chunk_size
+   b. Schedule initial read-ahead window [0, read_ahead)
+   c. Workers fetch chunks in parallel → deposit into buffer dict
+   d. Generator yields buffer[next_chunk] in order → handler writes to Kodi
+   e. RAM freed immediately after each yield
+   f. On BrokenPipe → abort_event → cancel futures → clear buffer
+
+6. Stats updated throughout → OSD overlay reads at 500ms intervals
+```
+
+---
+
+## 7. Design Decisions & Fixes Applied
+
+During design review, 12 bugs/gaps were identified in the original spec. All have been fixed in the implementation:
+
+### Critical (would have broken playback)
+
+| # | Issue | Fix Applied |
+|---|---|---|
+| 1 | **200 response = OOM crash.** Workers accepted `200`, meaning every thread would download the entire file if the server ignored Range headers. | Workers only accept `206`. A `200` response triggers immediate abort with logged error. |
+| 2 | **Redirect amplification.** Each worker independently followed 302 redirects. TorBox single-use tokens would fail for N-1 threads. | `probe_upstream()` captures `resp.url` (final redirected URL) and passes it to all workers. |
+| 3 | **Small-read bypass described but not implemented.** MKV header/cue reads (~few KB) would spin up full thread pool, adding 50-200ms latency per seek. | `_handle_request()` checks `content_length ≤ small_read_threshold` → routes to `_single_range_fetch()`. |
+| 4 | **`total_size=0` on chunked-encoding servers.** No Content-Length and no Content-Range → `end_byte = -1`, Kodi gets `Content-Length: 0`. | HEAD probe first; if no size, GET `bytes=0-0` fallback; if still 0, raise clear `ValueError`. |
+
+### Medium (silent degradation or edge-case failures)
+
+| # | Issue | Fix Applied |
+|---|---|---|
+| 5 | Probe used `GET` instead of `HEAD`. | HEAD first, GET fallback only if needed. |
+| 6 | `executor.shutdown(wait=False)` didn't cancel queued futures — workers hung until 15s timeout. | `shutdown(wait=False, cancel_futures=True)` with Python <3.9 fallback. |
+| 7 | `Content-Range` sent on `200` responses (HTTP spec violation). | Only included in `206` responses. |
+| 8 | Response objects not explicitly closed in `_fetch_chunk`. | `resp.close()` in `finally` block on every path. |
+| 9 | No port-in-use error handling — service silently died. | `OSError` caught, fallback to `port+1`, clear error logging. |
+| 10 | No logging anywhere in engine or server. | `xbmc.log` calls at all key points: probe, chunk fetch, retry, abort, failure. |
+
+### Minor (defensive improvements)
+
+| # | Issue | Fix Applied |
+|---|---|---|
+| 11 | `read_ahead` minimum was clamped to `threads`, silently inflating RAM. | Minimum is now `2`, independent of thread count. |
+| 12 | `parse_kodi_url()` called redundantly in both server and engine. | Parsed once in `_handle_request()`, clean URL + headers passed to engine. |
+
+---
+
+## 8. Testing & A/B Comparison
+
+### A/B Testing Procedure
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  A/B TESTING WORKFLOW                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  SETUP                                                      │
+│  1. Install service.stream.accelerator in Kodi              │
+│  2. Pick a test file (ideally ≥2 GB from target provider)   │
+│  3. Route the URL through the proxy (proxify or manual URL) │
+│                                                             │
+│  TEST A — PROXY ON (accelerated)                            │
+│  4. Start playback                                          │
+│  5. Press Ctrl+D → overlay appears (top-right)              │
+│  6. Record:                                                 │
+│     • Live speed (Mbit/s)                                   │
+│     • Average speed (Mbit/s)                                │
+│     • Buffer fill level (stays near max = good)             │
+│     • Failed chunks (should be 0)                           │
+│     • Time-to-first-frame (stopwatch from play press)       │
+│  7. Test seeking: skip forward 3 times, note responsiveness │
+│  8. Let it play for 60 seconds minimum                      │
+│  9. Stop playback                                           │
+│                                                             │
+│  TEST B — PROXY OFF (direct comparison)                     │
+│  10. Press Ctrl+Shift+D → "Proxy OFF" notification          │
+│  11. Start the SAME file again                              │
+│  12. Press Ctrl+D → overlay shows "PROXY DISABLED"          │
+│      (Kodi's built-in player info: press 'O' for OSD info)  │
+│  13. Record same metrics via Kodi's debug info              │
+│  14. Test seeking: skip forward 3 times, note responsiveness│
+│  15. Let it play for 60 seconds minimum                     │
+│  16. Stop playback                                          │
+│                                                             │
+│  COMPARE                                                    │
+│  17. Press Ctrl+Shift+D → "Proxy ON" to re-enable           │
+│  18. Compare:                                               │
+│      • Proxy speed vs. direct speed (expect 2-6x faster)    │
+│      • Time-to-first-frame (proxy may be slightly slower     │
+│        on initial probe, but faster for large files)         │
+│      • Seek responsiveness (proxy should be similar or       │
+│        faster due to pre-buffered chunks)                   │
+│      • Buffer stalls (proxy should have fewer/none)          │
+│                                                             │
+│  REPEAT per provider (Easynews, Premiumize, TorBox)         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### What to Look For in the Overlay
+
+| Metric | Healthy | Warning | Problem |
+|---|---|---|---|
+| Live speed | ≥ 20 Mbit/s (green) | 5–20 Mbit/s (yellow) | < 5 Mbit/s (red) |
+| Buffer fill | 60–100% | 25–60% | < 25% (starving) |
+| Failed chunks | 0 | 1–3 (retries worked) | ≥ 4 (upstream issue) |
+| Active workers | Near threads count | Fluctuating | 0 for extended time |
+| Seeks/aborts | Low | — | High without user input = bug |
+
+### Debugging via kodi.log
+
+All operations log to `kodi.log` with the `[StreamAccelerator]` prefix:
+
+```
+[StreamAccelerator.Server] HEAD probe: size=4294967296, type=video/x-matroska, ranges=True, final_url=https://cdn.example.com/video.mkv
+[StreamAccelerator.Server] Parallel stream: 4294967296 bytes, 6 threads, 1024KB chunks, read_ahead=12
+[StreamAccelerator.Engine] Stream init: 4294967296 bytes, 4096 chunks, 6 threads, 1048576 B/chunk, read_ahead=12
+[StreamAccelerator.Engine] Chunk 42 attempt 1: timeout
+[StreamAccelerator.Engine] Client disconnected (seek/stop)
+[StreamAccelerator.Engine] Closing stream engine
+```
+
+Set Kodi's log level to **Debug** to see per-chunk messages.
+
+---
+
+## 9. Integration Guide
+
+### Method 1: Import the module (recommended)
+
+In your add-on's `addon.xml`:
+```xml
+<import addon="service.stream.accelerator"/>
+```
+
+In your Python code, right before `setResolvedUrl`:
+```python
+import stream_accelerator
+resolved_url = stream_accelerator.proxify(resolved_url, threads=8, chunk_kb=1024)
+xbmcplugin.setResolvedUrl(handle, True, xbmcgui.ListItem(path=resolved_url))
+```
+
+### Method 2: Direct URL formatting (no import needed)
+
+```python
+from urllib.parse import quote
+proxy_url = f"http://127.0.0.1:48990/stream?url={quote(raw_url, safe='')}"
+```
+
+### Method 3: .strm files
+
+```
+http://127.0.0.1:48990/stream?url=https%3A%2F%2Feasynews.example%2Fmovie.mkv
+```
+
+### Compatible add-ons
+
+| Add-on | Integration Point |
+|---|---|
+| **KodiStremioBridge** | Wrap resolved URL before `setResolvedUrl` |
+| **POV / Fen Light** | Wrap in `resolve_url()` method |
+| **TMDbHelper** | Wrap in player file URL resolution |
+| **Any custom add-on** | Before `setResolvedUrl` or in `.strm` files |
+
+---
+
+## 10. Complete Implementation Reference
+
+The full implementation is in the `service.stream.accelerator/` directory. Each file's role:
+
+| File | Lines | Purpose |
+|---|---|---|
+| [`addon.xml`](service.stream.accelerator/addon.xml) | 22 | Kodi add-on manifest: service + module + script extensions |
+| [`service.py`](service.stream.accelerator/service.py) | 106 | Daemon lifecycle: server start, keymap install, abort wait, cleanup |
+| [`script.py`](service.stream.accelerator/script.py) | 22 | RunScript entry: dispatches "overlay" and "toggle" commands |
+| [`resources/settings.xml`](service.stream.accelerator/resources/settings.xml) | 14 | GUI settings definition |
+| [`resources/lib/__init__.py`](service.stream.accelerator/resources/lib/__init__.py) | 40 | `proxify()` helper function |
+| [`resources/lib/stats.py`](service.stream.accelerator/resources/lib/stats.py) | 103 | `StreamStats` singleton: thread-safe metrics, rolling speed window |
+| [`resources/lib/engine.py`](service.stream.accelerator/resources/lib/engine.py) | 166 | `ParallelRangeStream`: ThreadPoolExecutor, sliding window, abort |
+| [`resources/lib/server.py`](service.stream.accelerator/resources/lib/server.py) | 270 | `ProxyHandler` + `probe_upstream()`: HTTP 206, dual probe, routing |
+| [`resources/lib/overlay.py`](service.stream.accelerator/resources/lib/overlay.py) | 224 | `StatsOverlay` window + `toggle_overlay()` / `toggle_proxy()` |
+
+**Total:** ~967 lines of Python + XML across 9 files.
