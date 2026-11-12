@@ -86,7 +86,7 @@ The add-on is a **triple-extension** Kodi package:
 │             │                                      │              │
 │             ▼                                      ▼              │
 │  ┌─────────────────────────────────────────────────────────────┐ │
-│  │  StreamStats singleton ◄──── OSD Overlay (Ctrl+D)           │ │
+│  │  StreamStats singleton ◄──── OSD Overlay (Ctrl+L)           │ │
 │  │  (stats.py)                  (overlay.py)                   │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
@@ -153,7 +153,7 @@ The proxy automatically selects the best strategy per-request:
 | `read_ahead` | Slider | 12 | 2–32 | Max chunks buffered ahead in RAM |
 | `retries` | Slider | 3 | 1–10 | Retry attempts per failed chunk |
 | `small_read_threshold_mb` | Slider | 4 | 1–8 | Below this size, skip threading |
-| `overlay_enabled` | Bool | `true` | — | Allow Ctrl+D stats overlay hotkey |
+| `overlay_enabled` | Bool | `true` | — | Allow Ctrl+L stats overlay hotkey |
 | `verbose_logging` | Bool | `false` | — | Write detailed diagnostics (timings, chunks, stalls) to `kodi.log` at `LOGINFO` without enabling Kodi's debug overlay |
 
 **RAM footprint:** With defaults (1 MB chunks × 12 read-ahead), peak RAM is capped at **12 MB**. On Android TV with limited RAM, reduce `read_ahead` to 6–8.
@@ -324,12 +324,12 @@ A non-focus-stealing `xbmcgui.WindowDialog` rendered in the top-right corner of 
 
 | Shortcut | Keymap Tag | Action |
 |---|---|---|
-| **Ctrl+D** | `<d mod="ctrl">` (`0x1f044`) | Toggle the OSD stats overlay on/off |
-| **Ctrl+Shift+D** | `<d mod="ctrl,shift">` (`0x3f044`) | Toggle proxy acceleration on/off (affects next stream) |
+| **Ctrl+L** | `<l mod="ctrl">` (`0x1f04c`) | Toggle the OSD stats overlay on/off |
+| **Ctrl+Shift+L** | `<l mod="ctrl,shift">` (`0x3f04c`) | Toggle proxy acceleration on/off (affects next stream) |
 
 **Implementation (Sub-Interpreter IPC):** In Kodi's `XBPython`, `xbmc.service` (`service.py`) and `RunScript()` (`script.py`) run in separate Python sub-interpreters with isolated memory heaps. Therefore:
 1. The service installs a keymap XML to `special://profile/keymaps/accelerator_keymap.xml` (covering `<global>`, `<FullscreenVideo>`, and `<VideoOSD>`) on startup and removes it on shutdown.
-2. Pressing Ctrl+D or Ctrl+Shift+D launches `script.py`, which discovers the active port and sends an HTTP request to `http://127.0.0.1:<port>/control?action=overlay` or `?action=toggle`.
+2. Pressing Ctrl+L or Ctrl+Shift+L launches `script.py`, which discovers the active port and sends an HTTP request to `http://127.0.0.1:<port>/control?action=overlay` or `?action=toggle`.
 3. `ProxyHandler._handle_control()` handles the request inside the `service.py` interpreter, where live `StreamStats`, `_proxy_enabled`, and `StatsOverlay` live.
 
 **Toggle behavior:**
@@ -470,7 +470,7 @@ During design review, 12 bugs/gaps were identified in the original spec. All hav
 │                                                             │
 │  TEST A — PROXY ON (accelerated)                            │
 │  4. Start playback                                          │
-│  5. Press Ctrl+D → overlay appears (top-right)              │
+│  5. Press Ctrl+L → overlay appears (top-right)              │
 │  6. Record:                                                 │
 │     • Live speed (Mbit/s)                                   │
 │     • Average speed (Mbit/s)                                │
@@ -482,9 +482,9 @@ During design review, 12 bugs/gaps were identified in the original spec. All hav
 │  9. Stop playback                                           │
 │                                                             │
 │  TEST B — PROXY OFF (direct comparison)                     │
-│  10. Press Ctrl+Shift+D → "Proxy OFF" notification          │
+│  10. Press Ctrl+Shift+L → "Proxy OFF" notification          │
 │  11. Start the SAME file again                              │
-│  12. Press Ctrl+D → overlay shows "PROXY DISABLED"          │
+│  12. Press Ctrl+L → overlay shows "PROXY DISABLED"          │
 │      (Kodi's built-in player info: press 'O' for OSD info)  │
 │  13. Record same metrics via Kodi's debug info              │
 │  14. Test seeking: skip forward 3 times, note responsiveness│
@@ -492,7 +492,7 @@ During design review, 12 bugs/gaps were identified in the original spec. All hav
 │  16. Stop playback                                          │
 │                                                             │
 │  COMPARE                                                    │
-│  17. Press Ctrl+Shift+D → "Proxy ON" to re-enable           │
+│  17. Press Ctrl+Shift+L → "Proxy ON" to re-enable           │
 │  18. Compare:                                               │
 │      • Proxy speed vs. direct speed (expect 2-6x faster)    │
 │      • Time-to-first-frame (proxy may be slightly slower     │

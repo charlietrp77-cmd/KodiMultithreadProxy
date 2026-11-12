@@ -60,7 +60,7 @@ Open **Add-ons** → **My add-ons** → **Services** → **Multi-Threaded Stream
 | **Max Read-Ahead Chunks in RAM** | `12` | 12 MB RAM at default chunk size; lower to 6–8 on low-RAM Android boxes |
 | **Chunk Retry Attempts** | `3` | Retries per failed chunk before aborting |
 | **Small Read Bypass Threshold (MB)** | `4` | Requests ≤ threshold skip threading (fast header/cue reads) |
-| **Enable Stats Overlay Hotkey (Ctrl+D)** | `true` | Allows toggling the live OSD overlay |
+| **Enable Stats Overlay Hotkey (Ctrl+L)** | `true` | Allows toggling the live OSD overlay |
 | **Enable Verbose Logging** | `false` | Turn **ON** to write detailed diagnostics (probe timing, per-chunk throughput, slow-start, consumer stalls) directly to `kodi.log` **without** enabling Kodi's noisy system-wide debug overlay |
 
 ---
@@ -71,17 +71,17 @@ During playback, use these hotkeys to measure performance:
 
 | Hotkey | Action |
 |---|---|
-| **`Ctrl+D`** | Toggle the live **Stats Overlay** (top-right corner). Press `Back` / `Esc` or `Ctrl+D` again to close. Playback controls (Play/Pause, Seek, Stop) pass right through. |
-| **`Ctrl+Shift+D`** | Toggle proxy acceleration **ON / OFF** for the **next** stream (shows a Kodi notification). |
+| **`Ctrl+L`** | Toggle the live **Stats Overlay** (top-right corner). Press `Back` / `Esc` or `Ctrl+L` again to close. |
+| **`Ctrl+Shift+L`** | Toggle proxy acceleration **ON / OFF** for the **next** stream (shows a Kodi notification). |
 
 ### Suggested A/B Comparison Test
 
 1. Start an EasyNews video (ideally a large ≥2 GB 1080p/4K MKV).
-2. Press **`Ctrl+D`** to open the overlay — verify it says `● PROXY ACTIVE — ACCELERATED` and check live speed, avg speed, worker activity, and buffer fill.
+2. Press **`Ctrl+L`** to open the overlay — verify it says `● PROXY ACTIVE — ACCELERATED` and check live speed, avg speed, worker activity, and buffer fill.
 3. Let it play ~60 seconds and test seeking forward a few times. Stop playback.
-4. Press **`Ctrl+Shift+D`** → notification shows **Proxy OFF — next stream goes direct**.
-5. Start the **same** video again → press **`Ctrl+D`** to confirm `○ PROXY DISABLED` (or press `O` for Kodi's built-in codec/buffer OSD) and compare buffering/speed.
-6. Press **`Ctrl+Shift+D`** again to switch back **ON**.
+4. Press **`Ctrl+Shift+L`** → notification shows **Proxy OFF — next stream goes direct**.
+5. Start the **same** video again → press **`Ctrl+L`** to confirm `○ PROXY DISABLED` (or press `O` for Kodi's built-in codec/buffer OSD) and compare buffering/speed.
+6. Press **`Ctrl+Shift+L`** again to switch back **ON**.
 
 ---
 

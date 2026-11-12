@@ -1,8 +1,8 @@
 """Script entry point for RunScript() hotkey actions.
 
 Called via:
-  RunScript(service.stream.accelerator, overlay)   → Ctrl+D
-  RunScript(service.stream.accelerator, toggle)    → Ctrl+Shift+D
+  RunScript(service.stream.accelerator, overlay)   → Ctrl+L
+  RunScript(service.stream.accelerator, toggle)    → Ctrl+Shift+L
 
 CRITICAL: RunScript() runs in a SEPARATE Python sub-interpreter from
 service.py. We CANNOT share memory (StreamStats, StatsOverlay, etc.)

@@ -225,7 +225,7 @@ class StatsOverlay(xbmcgui.WindowDialog):
 
         elif not proxy_enabled:
             self._status.setLabel("[B][COLOR FFFF8800]○ PROXY DISABLED — next stream goes direct[/COLOR][/B]")
-            self._labels["speed"].setLabel("Toggle back on with Ctrl+Shift+D")
+            self._labels["speed"].setLabel("Toggle back on with Ctrl+Shift+L")
             for field in list(self._labels.keys())[1:]:
                 self._labels[field].setLabel("")
 

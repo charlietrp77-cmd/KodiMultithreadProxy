@@ -9,7 +9,7 @@
         <setting id="small_read_threshold_mb" type="slider" label="Small Read Bypass Threshold (MB)" default="4" range="1,1,8" option="int"/>
     </category>
     <category label="Overlay">
-        <setting id="overlay_enabled" type="bool" label="Enable Stats Overlay Hotkey (Ctrl+D)" default="true"/>
+        <setting id="overlay_enabled" type="bool" label="Enable Stats Overlay Hotkey (Ctrl+L)" default="true"/>
     </category>
     <category label="Debugging">
         <setting id="verbose_logging" type="bool" label="Enable Verbose Logging (writes detailed diagnostics to kodi.log)" default="false"/>

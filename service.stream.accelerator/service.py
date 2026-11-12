@@ -3,7 +3,7 @@
 This runs as an xbmc.service (start="login"), meaning it launches when
 Kodi starts and runs until Kodi exits. It:
   1. Starts the ThreadingHTTPServer on 127.0.0.1:<port>
-  2. Installs the hotkey keymap (Ctrl+D, Ctrl+Shift+D)
+  2. Installs the hotkey keymap (Ctrl+L, Ctrl+Shift+L)
   3. Waits for Kodi abort signal
   4. Cleans up server, keymap, and threads
 """
@@ -17,27 +17,27 @@ from resources.lib.server import ProxyHandler
 from resources.lib.logutil import refresh_verbose
 
 # ── Keymap XML content ────────────────────────────────────────────────────────
-# Ctrl+D       (<d mod="ctrl">,       0x1f044): Toggle stats overlay
-# Ctrl+Shift+D (<d mod="ctrl,shift">, 0x3f044): Toggle proxy on/off
+# Ctrl+L       (<l mod="ctrl">,       0x1f04c): Toggle stats overlay
+# Ctrl+Shift+L (<l mod="ctrl,shift">, 0x3f04c): Toggle proxy on/off
 KEYMAP_XML = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <keymap>
     <global>
         <keyboard>
-            <d mod="ctrl">RunScript(service.stream.accelerator,overlay)</d>
-            <d mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</d>
+            <l mod="ctrl">RunScript(service.stream.accelerator,overlay)</l>
+            <l mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</l>
         </keyboard>
     </global>
     <FullscreenVideo>
         <keyboard>
-            <d mod="ctrl">RunScript(service.stream.accelerator,overlay)</d>
-            <d mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</d>
+            <l mod="ctrl">RunScript(service.stream.accelerator,overlay)</l>
+            <l mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</l>
         </keyboard>
     </FullscreenVideo>
     <VideoOSD>
         <keyboard>
-            <d mod="ctrl">RunScript(service.stream.accelerator,overlay)</d>
-            <d mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</d>
+            <l mod="ctrl">RunScript(service.stream.accelerator,overlay)</l>
+            <l mod="ctrl,shift">RunScript(service.stream.accelerator,toggle)</l>
         </keyboard>
     </VideoOSD>
 </keymap>
