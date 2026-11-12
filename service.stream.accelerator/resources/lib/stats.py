@@ -7,6 +7,8 @@ class StreamStats:
     """Thread-safe singleton collecting real-time streaming metrics.
 
     The engine writes to this; the overlay reads from it.
+    Uses a stream_id counter to prevent stale threads from clobbering
+    a new stream's stats on seek/abort overlap.
     """
     _instance = None
     _lock = threading.Lock()
@@ -21,8 +23,8 @@ class StreamStats:
 
     def __init__(self):
         self.active = False
-        self.enabled = True        # User toggle: proxy on/off for NEXT stream
         self.lock = threading.Lock()
+        self.stream_id = 0             # Monotonic counter, incremented on reset()
 
         # Per-stream metadata (reset on each new stream)
         self.file_size = 0
@@ -30,7 +32,7 @@ class StreamStats:
         self.upstream_url = ""
         self.threads_configured = 0
         self.chunk_size = 0
-        self.mode = "idle"         # "idle" | "accelerated" | "direct" | "bypass_small"
+        self.mode = "idle"             # "idle" | "accelerated" | "direct" | "bypass_small"
 
         # Live counters
         self.bytes_delivered = 0
@@ -47,8 +49,10 @@ class StreamStats:
         self.start_time = 0.0
 
     def reset(self, file_size, content_type, url, threads, chunk_size, read_ahead, mode="accelerated"):
-        """Called at the start of each new stream."""
+        """Called at the start of each new stream. Returns the new stream_id."""
         with self.lock:
+            self.stream_id += 1
+            sid = self.stream_id
             self.active = True
             self.file_size = file_size
             self.content_type = content_type
@@ -66,16 +70,15 @@ class StreamStats:
             self.mode = mode
             self._speed_samples.clear()
             self.start_time = time.monotonic()
+            return sid
 
     def record_chunk_delivered(self, size_bytes):
-        """Called when a chunk is written to Kodi's socket."""
         with self.lock:
             self.bytes_delivered += size_bytes
             self.chunks_completed += 1
             self._speed_samples.append((time.monotonic(), size_bytes))
 
     def record_bytes_delivered(self, size_bytes):
-        """Called for direct passthrough byte tracking."""
         with self.lock:
             self.bytes_delivered += size_bytes
             self._speed_samples.append((time.monotonic(), size_bytes))
@@ -98,7 +101,6 @@ class StreamStats:
             self.active_workers = workers
 
     def get_speed_mbps(self):
-        """Rolling speed over the last 5 seconds, in Mbit/s."""
         with self.lock:
             now = time.monotonic()
             cutoff = now - 5.0
@@ -123,8 +125,36 @@ class StreamStats:
         with self.lock:
             return (self.bytes_delivered * 8) / (elapsed * 1_000_000)
 
-    def stop(self):
+    def stop(self, stream_id=None):
+        """Mark stream as inactive. If stream_id is given, only stop if it
+        matches the current stream — prevents stale threads from clobbering."""
         with self.lock:
+            if stream_id is not None and stream_id != self.stream_id:
+                return  # Stale thread, ignore
             self.active = False
             self.active_workers = 0
 
+    def to_dict(self):
+        """Snapshot of all stats as a plain dict (for JSON serialization)."""
+        with self.lock:
+            return {
+                "active": self.active,
+                "stream_id": self.stream_id,
+                "mode": self.mode,
+                "file_size": self.file_size,
+                "content_type": self.content_type,
+                "upstream_url": self.upstream_url,
+                "threads_configured": self.threads_configured,
+                "chunk_size": self.chunk_size,
+                "bytes_delivered": self.bytes_delivered,
+                "chunks_completed": self.chunks_completed,
+                "chunks_failed": self.chunks_failed,
+                "chunks_retried": self.chunks_retried,
+                "active_workers": self.active_workers,
+                "buffer_fill": self.buffer_fill,
+                "buffer_max": self.buffer_max,
+                "seeks": self.seeks,
+                "speed_mbps": self.get_speed_mbps(),
+                "avg_speed_mbps": self.get_avg_speed_mbps(),
+                "elapsed": self.get_elapsed(),
+            }

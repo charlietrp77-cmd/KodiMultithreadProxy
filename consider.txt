@@ -1,0 +1,169 @@
+Reading spec.md alongside the source code clarifies the exact design goals—especially the TorBox single-use redirect token support, Easynews rate-limit safety, A/B testing workflow, and Method 1 (import stream_accelerator) integration.   
+spec.md
+
+However, comparing the specification's promises against the actual implementation exposes 4 additional spec-vs-code mismatches on top of the core runtime bugs identified earlier.
+
+1. New Bugs Exposed by spec.md
+A. TorBox "Single-Use Redirect Token" Will Still Break (Probe Cache Missing)
+The Spec Claim (Section 4 & 5C): "TorBox: 302 → single-use token... Redirect must be resolved once during probe and the final URL reused by all workers. Implemented in probe_upstream()."   
+spec.md
+
+Why the Code Actually Breaks on TorBox:
+
+Inside a single probe_upstream() call: If TorBox's HEAD request does not return Accept-Ranges: bytes (many CDNs omit Accept-Ranges on HEAD), probe_upstream() falls back to Phase 2 (GET with Range: bytes=0-0) using the original clean_url instead of final_url from Phase 1! That immediately burns a second redirect on the single-use token.   
+server.py
++ 1
+
+Across FFmpeg's 3 Startup Requests: When Kodi opens an MKV, FFmpeg makes 3 to 4 separate HTTP connections to /stream (Header -> Cues at EOF -> Video Track). Because probe_upstream() is called fresh on every _handle_request(), Request #1 consumes the single-use 302 token on clean_url. When Request #2 arrives 50ms later for the MKV Cues, probe_upstream(clean_url) hits the original TorBox URL a second time—and the single-use token is now expired/invalid, throwing 502 Upstream probe failed!   
+spec.md
++ 4
+
+The Fix:
+
+Cache UpstreamProbeResult in memory keyed by clean_url so FFmpeg's 2nd, 3rd, and 4th range requests reuse the final_url from Request #1 without ever hitting the original 302 URL again.
+
+In probe_upstream(), if Phase 1 (HEAD) resolves a redirect (resp.url != clean_url) before falling back to Phase 2 (GET), Phase 2 must query final_url, not clean_url.   
+server.py
+
+B. Spec Section 9 (import stream_accelerator) Will Throw ModuleNotFoundError
+The Spec Claim (Section 9):
+
+Python
+import stream_accelerator
+resolved_url = stream_accelerator.proxify(...)
+   
+spec.md
+
+Why It Fails: In addon.xml, your module extension is declared as:
+
+XML
+<extension point="xbmc.python.module" library="resources/lib"/>
+Kodi appends service.stream.accelerator/resources/lib/ directly to sys.path. Because __init__.py is inside resources/lib/ (not inside resources/lib/stream_accelerator/__init__.py), Python sees stats, engine, server, overlay as top-level modules, and there is no module named stream_accelerator!   
+spec.md
+
+The Fix: Either:
+
+Create a resources/lib/stream_accelerator/__init__.py package directory (or resources/lib/stream_accelerator.py) that exposes proxify(), OR
+
+Change addon.xml to <extension point="xbmc.python.module" library="resources"/> and rename lib to stream_accelerator.
+
+C. Spec Section 5D Claim About Small-Read Bypass Is Mathematically False for Step 1
+The Spec Claim (Section 5D): "On MKV/MP4 startup, it: 1. GET Range: bytes=0- -> reads file header (a few KB)... Requests where content_length <= small_read_threshold (default 2 MB) are served by a single direct HTTP request... This handles the header/cue reads in steps 1 and 2".   
+spec.md
+
+Why Step 1 Never Hits Small-Read Bypass: Look at server.py lines 206–215:   
+server.py
+
+Python
+start_byte = 0
+end_byte = total_size - 1
+if range_header:
+    match = RANGE_RE.search(range_header)
+    if match:
+        start_byte = int(match.group(1))
+        if match.group(2): # <-- EMPTY STRING on "bytes=0-"!
+            end_byte = min(int(match.group(2)), total_size - 1)
+content_length = (end_byte - start_byte) + 1
+When FFmpeg sends Range: bytes=0- on Step 1, match.group(2) is "" (empty). Therefore, end_byte remains total_size - 1 (e.g., 4,294,967,295), and content_length is 4 GB, NOT "a few KB"!   
+spec.md
++ 3
+
+Step 2 (Range: bytes=4294000000-) has content_length < 2 MB, so Step 2 does hit bypass_small.   
+server.py
++ 1
+
+Step 1 (Range: bytes=0-) has content_length == total_size, so Step 1 always launches the full 6-thread ParallelRangeStream just for FFmpeg to read 32 KB and abort 40ms later!   
+engine.py
++ 2
+
+The Fix: Add Chunk-0 Slow Start in engine.py (ParallelRangeStream._schedule_window): when self.next_chunk_to_yield == 0, only dispatch 1 worker (Chunk 0). Only dispatch the remaining read_ahead chunks across all 6 threads after Kodi actually finishes reading Chunk 0 and requests Chunk 1.   
+engine.py
+
+D. The A/B Testing Workflow (Ctrl+D and Ctrl+Shift+D) Will Completely Fail in Kodi
+The Spec Claim (Section 5G & Section 8): Press Ctrl+D (RunScript(service.stream.accelerator, overlay)) to view live metrics, and Ctrl+Shift+D (RunScript(service.stream.accelerator, toggle)) to toggle StreamStats.instance().enabled for A/B testing.   
+service.py
++ 2
+
+Why It Fails (Recap of the Sub-Interpreter Bug):
+
+In Kodi's C++ Python engine (XBPython), xbmc.service (service.py) runs in Interpreter #1.   
+service.py
++ 1
+
+Every time you press Ctrl+D or Ctrl+Shift+D, RunScript(...) spawns Interpreter #2 (script.py), which has a completely separate memory heap.   
+service.py
++ 2
+
+Toggling StreamStats.instance().enabled in script.py modifies Interpreter #2's RAM (which is garbage-collected 5ms later when script.py exits). Interpreter #1 (service.py / server.py) never sees stats.enabled change!   
+stats.py
++ 4
+
+Opening StatsOverlay in script.py reads Interpreter #2's empty StreamStats (◌ IDLE — no active stream) instead of Interpreter #1's active stream stats!   
+stats.py
++ 2
+
+2. Complete Summary Checklist of All Fixes Needed
+Severity	File(s)	Issue	Resolution
+CRITICAL	script.py, server.py, service.py	
+RunScript runs in an isolated Python interpreter; StreamStats and StatsOverlay cannot share memory between script.py and service.py. 
+stats.py
++ 3
+
+Have script.py send an HTTP GET /control?action=overlay|toggle to 127.0.0.1:<port>, and handle toggle_overlay() / toggle_proxy() inside server.py (which lives in service.py's process). 
+server.py
++ 2
+
+CRITICAL	server.py	
+probe_upstream() is uncached; runs on every seek/range request and breaks TorBox single-use redirect tokens on FFmpeg's 2nd request. 
+server.py
++ 1
+
+Cache UpstreamProbeResult in _PROBE_CACHE[clean_url] with a 15-min TTL, and pass final_url from HEAD to GET fallback. 
+server.py
+
+CRITICAL	resources/lib/	
+import stream_accelerator (Spec Section 9) throws ModuleNotFoundError because files are flat in resources/lib/. 
+spec.md
+
+Add resources/lib/stream_accelerator.py that re-exports proxify so both import stream_accelerator and package imports work. 
+spec.md
+
+HIGH	engine.py	
+Step 1 (Range: bytes=0-) has content_length = total_size, bypassing small_threshold and launching 6 threads that cannot abort mid-chunk (stream=False). 
+engine.py
++ 2
+
+1. Add Slow-Start on next_chunk_to_yield == 0 (fetch only Chunk 0 first). 
+engine.py
+
+
+2. Use stream=True + iter_content(65536) checking abort_event for instant socket close on seek. 
+engine.py
+
+HIGH	overlay.py	
+StatsOverlay(xbmcgui.WindowDialog) is modal and steals remote/keyboard focus from FullscreenVideo while open. 
+overlay.py
++ 1
+
+Override onAction() in StatsOverlay to close on Back and pass player keys (Pause, Stop, Seek, OSD) through to Kodi. 
+overlay.py
+
+MEDIUM	stats.py, server.py, engine.py	
+Overlapping sockets during seek cause the old thread's finally: stats.stop() to overwrite the new thread's stats.reset() (active=False). 
+stats.py
++ 2
+
+Add a stream_id counter in stats.reset() and ignore stats.stop(stream_id) from stale threads. 
+stats.py
++ 2
+
+MEDIUM	engine.py	
+active_workers reports len(self.in_flight) (which equals read_ahead=12) instead of actual running threads (6), displaying 11 / 6 active. 
+engine.py
++ 1
+
+Track an explicit self.active_workers counter inside _fetch_chunk. 
+engine.py
+
+LOW	service.py, __init__.py	
+If port falls back to port + 1, proxify() and script.py still read the old po
